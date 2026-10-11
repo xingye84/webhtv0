@@ -167,10 +167,16 @@ public class HomeActivity extends BaseActivity implements CustomTitleView.Listen
     private void initAfterFirstFrame() {
         SpiderDebug.log("startup", "home first frame cost=%sms", System.currentTimeMillis() - App.time());
         App.post(this::initConfig, 80);
-        App.post(() -> PermissionUtil.requestFile(this, allGranted -> {
+        App.post(() -> {
             PermissionUtil.requestNotify(this);
-            if (allGranted) initConfig();
-        }), 1800);
+            if (PermissionUtil.requiresFileAccess(Config.vod().getUrl())
+                    || PermissionUtil.requiresFileAccess(Config.live().getUrl())
+                    || PermissionUtil.requiresFileAccess(Config.wall().getUrl())) {
+                PermissionUtil.requestFile(this, allGranted -> {
+                    if (allGranted) initConfig();
+                });
+            }
+        }, 1800);
         App.post(() -> DLNARendererService.start(this), 2500);
     }
 
@@ -235,15 +241,24 @@ public class HomeActivity extends BaseActivity implements CustomTitleView.Listen
         if (Intent.ACTION_SEND.equals(intent.getAction())) {
             VideoActivity.push(this, intent.getStringExtra(Intent.EXTRA_TEXT));
         } else if (Intent.ACTION_VIEW.equals(intent.getAction()) && intent.getData() != null) {
-            PermissionUtil.requestFile(this, allGranted -> checkType(intent));
+            if (PermissionUtil.requiresFileAccess(intent.getData().toString())
+                    || ("content".equalsIgnoreCase(intent.getData().getScheme()) && isList(intent))) {
+                PermissionUtil.requestFile(this, allGranted -> checkType(intent));
+            } else {
+                checkType(intent);
+            }
         } else if (Intent.ACTION_SEARCH.equals(intent.getAction())) {
             String keyword = intent.getStringExtra(SearchManager.QUERY);
             if (!TextUtils.isEmpty(keyword)) SearchActivity.start(this, keyword);
         }
     }
 
+    private boolean isList(Intent intent) {
+        return "text/plain".equals(intent.getType()) || UrlUtil.path(intent.getData()).endsWith(".m3u");
+    }
+
     private void checkType(Intent intent) {
-        if ("text/plain".equals(intent.getType()) || UrlUtil.path(intent.getData()).endsWith(".m3u")) {
+        if (isList(intent)) {
             loadLive("file:/" + FileChooser.getPathFromUri(intent.getData()));
         } else {
             VideoActivity.push(this, intent.getData().toString());

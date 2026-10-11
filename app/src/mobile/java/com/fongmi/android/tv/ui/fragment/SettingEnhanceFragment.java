@@ -206,7 +206,10 @@ public class SettingEnhanceFragment extends BaseFragment {
     }
 
     private void setFileSites(View view) {
-        SourceBlockDialog.create(this::setText).show(this);
+        SourceBlockDialog.create(() -> {
+            if (PermissionUtil.requiresSourceFileAccess()) PermissionUtil.requestFile(this, granted -> setText());
+            else setText();
+        }).show(this);
     }
 
     private void setDriveCheck(View view) {
