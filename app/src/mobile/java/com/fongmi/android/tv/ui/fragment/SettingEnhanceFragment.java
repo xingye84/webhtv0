@@ -93,11 +93,7 @@ public class SettingEnhanceFragment extends BaseFragment {
         mBinding.shellProxy.setOnClickListener(view -> ShellProxyDialog.show(this, this::setText));
         mBinding.shellProxy.setOnLongClickListener(v -> false);
         mBinding.shellProxyConfig.setVisibility(View.GONE);
-        mBinding.customCsp.setOnClickListener(view -> PermissionUtil.requestFile(this, granted -> {
-            if (!isAdded() || isStateSaved() || getActivity() == null) return;
-            if (granted) CustomCspDialog.show(this, this::setText);
-            else Notify.show(R.string.setting_custom_csp_permission_required);
-        }));
+        mBinding.customCsp.setOnClickListener(view -> CustomCspDialog.show(this, this::setText));
         mBinding.loginState.setOnClickListener(view -> LoginStateLearnDialog.show(this, this::setText));
         mBinding.oneKeySync.setOnClickListener(v -> OneKeySyncDialog.create().show(requireActivity()));
     }
@@ -206,7 +202,9 @@ public class SettingEnhanceFragment extends BaseFragment {
     }
 
     private void setFileSites(View view) {
-        SourceBlockDialog.create(this::setText).show(this);
+        SourceBlockDialog.create(() -> {
+            setText();
+        }).show(this);
     }
 
     private void setDriveCheck(View view) {

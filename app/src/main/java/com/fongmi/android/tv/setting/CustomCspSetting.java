@@ -38,7 +38,8 @@ import java.util.regex.Pattern;
 
 public class CustomCspSetting {
 
-    private static final String DIR = "TV/CustomCsp";
+    private static final String DIR = "CustomCsp";
+    private static final String PORTABLE_URL = "file://TV/CustomCsp/";
     private static final String REGISTRY = "registry.json";
     private static final String PREFIX = "__custom_csp_";
     private static final int MAX_INSERT_INDEX = 9;
@@ -56,7 +57,7 @@ public class CustomCspSetting {
     private static final Pattern JS_LIVE_METHOD = Pattern.compile("(?m)(?:^|[,{;]\\s*)(?:async\\s+)?liveContent\\s*(?:[:=]\\s*(?:async\\s*)?(?:function\\s*)?|\\()", Pattern.CASE_INSENSITIVE);
 
     public static Registry load() {
-        String text = Path.read(registryFile());
+        String text = Path.read(registryFile()).replace(PORTABLE_URL, localPrefix());
         return objectFrom(text);
     }
 
@@ -230,7 +231,6 @@ public class CustomCspSetting {
         if (TextUtils.isEmpty(api)) return false;
         try {
             String value = api.trim();
-            value = value.replace("clan://", "file://tvbox/");
             String path;
             if (value.startsWith("file://")) path = value.substring("file://".length());
             else {
@@ -291,17 +291,15 @@ public class CustomCspSetting {
     }
 
     public static void save(Registry registry) {
-        ensureFileAccess();
         Set<String> before = itemIds(load());
         File file = registryFile();
-        String text = App.gson().toJson(registry.normalize());
+        String text = App.gson().toJson(registry.normalize()).replace(localPrefix(), PORTABLE_URL);
         Path.write(file, text.getBytes(StandardCharsets.UTF_8));
         ensureWritten(file, text);
         cleanupRemovedFiles(before, itemIds(registry));
     }
 
     public static void writePage(String id, String code) {
-        ensureFileAccess();
         File file = file(id, "index.html");
         String text = code == null ? "" : code;
         Path.write(file, text.getBytes(StandardCharsets.UTF_8));
@@ -309,14 +307,12 @@ public class CustomCspSetting {
     }
 
     public static void copyPage(File source, String id) {
-        ensureFileAccess();
         File file = file(id, "index.html");
         Path.copy(source, file);
         if (!source.exists() || !file.exists() || !Arrays.equals(Path.readToByte(source), Path.readToByte(file))) throw new IllegalStateException(App.get().getString(R.string.setting_custom_csp_save_failed, file.getAbsolutePath()));
     }
 
     public static String copyFile(File source, String id) {
-        ensureFileAccess();
         if (source == null || !source.isFile()) throw new IllegalStateException(App.get().getString(R.string.setting_custom_csp_save_failed, ""));
         File file = file(id, source.getName());
         try {
@@ -357,16 +353,12 @@ public class CustomCspSetting {
         for (String id : before) if (!after.contains(id)) deleteFiles(id);
     }
 
-    private static void ensureFileAccess() {
-        if (!Setting.hasFileAccess()) throw new IllegalStateException(App.get().getString(R.string.setting_custom_csp_permission_required));
-    }
-
     private static void ensureWritten(File file, String text) {
         if (!file.exists() || !TextUtils.equals(Path.read(file), text)) throw new IllegalStateException(App.get().getString(R.string.setting_custom_csp_save_failed, file.getAbsolutePath()));
     }
 
     public static File dir() {
-        File dir = Path.root(DIR);
+        File dir = Path.files(DIR);
         if (!dir.exists()) dir.mkdirs();
         return dir;
     }
@@ -375,8 +367,12 @@ public class CustomCspSetting {
         return new File(new File(dir(), id), name);
     }
 
+    private static String localPrefix() {
+        return "file://" + dir().getAbsolutePath() + "/";
+    }
+
     public static String localUrl(String id, String name) {
-        return "file://" + DIR + "/" + id + "/" + name;
+        return localPrefix() + id + "/" + name;
     }
 
     public static Result inject(List<Site> sites) {
@@ -1165,7 +1161,6 @@ public class CustomCspSetting {
             site.setPlayUrl(webHomeOnly ? "" : getPlayUrl());
             site.setHide(getHide());
             site.setSearchable(getSearchable());
-            // searchable=0 且未显式配置 changeable 时，默认禁止参与自动换源(2)，可在界面改
             site.setChangeable(getSearchable() == 0 && this.changeable == null ? 2 : getChangeable());
             site.setQuickSearch(getQuickSearch());
             if (webHomeOnly && getExtensions() != null) site.setExtensions(getExtensions().deepCopy());
