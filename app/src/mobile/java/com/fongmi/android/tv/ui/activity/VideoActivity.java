@@ -70,6 +70,8 @@ import androidx.viewbinding.ViewBinding;
 import com.bumptech.glide.request.transition.Transition;
 import com.fongmi.android.tv.App;
 import com.fongmi.android.tv.Constant;
+import com.fongmi.android.tv.download.DownloadService;
+import com.fongmi.android.tv.download.DownloadManager;
 import com.fongmi.android.tv.R;
 import com.fongmi.android.tv.api.DanmakuApi;
 import com.fongmi.android.tv.api.SiteApi;
@@ -156,6 +158,7 @@ import com.fongmi.android.tv.utils.EpisodeTitleCompact;
 import com.fongmi.android.tv.utils.FileChooser;
 import com.fongmi.android.tv.utils.ImgUtil;
 import com.fongmi.android.tv.utils.Notify;
+import com.fongmi.android.tv.utils.PermissionUtil;
 import com.fongmi.android.tv.utils.PiP;
 import com.fongmi.android.tv.utils.ResUtil;
 import com.fongmi.android.tv.utils.Sniffer;
@@ -163,6 +166,7 @@ import com.fongmi.android.tv.utils.Task;
 import com.fongmi.android.tv.utils.Timer;
 import com.fongmi.android.tv.utils.Traffic;
 import com.fongmi.android.tv.utils.Util;
+import com.fongmi.android.tv.web.WebHomeInlineVodStore;
 import com.github.catvod.crawler.SpiderDebug;
 import com.google.android.material.bottomsheet.BottomSheetBehavior;
 import com.google.android.material.bottomsheet.BottomSheetDialog;
@@ -297,6 +301,7 @@ public class VideoActivity extends PlaybackActivity implements Clock.Callback, C
     private History mHistory;
     private boolean fullscreen;
     private boolean startFullscreen;
+    private boolean webHomeSniffer;
     private boolean initAuto;
     private boolean autoMode;
     private boolean revealManualSearch;
@@ -388,10 +393,21 @@ public class VideoActivity extends PlaybackActivity implements Clock.Callback, C
     });
 
     public static void push(FragmentActivity activity, String text) {
-        if (FileChooser.isValid(activity, Uri.parse(text))) file(activity, FileChooser.getPathFromUri(Uri.parse(text)));
-        else start(activity, Sniffer.getUrl(text));
+        push(activity, text, "");
     }
-
+ 
+    public static void push(FragmentActivity activity, String text, String name) {
+        if (TextUtils.isEmpty(text)) return;
+        if (FileChooser.isValid(activity, Uri.parse(text))) {
+            file(activity, FileChooser.getPathFromUri(Uri.parse(text)));
+            return;
+        }
+        // 带请求头的推送串（url@Headers=<json>）不能被正则截断，整串交给 PUSH 链路解析
+        String url = text.contains(Sniffer.HEADERS_TAG) ? text : Sniffer.getUrl(text);
+        if (TextUtils.isEmpty(url)) return;
+        start(activity, SiteApi.PUSH, url, TextUtils.isEmpty(name) ? Sniffer.pushUrl(url) : name);
+    }
+ 
     public static void file(FragmentActivity activity, String path) {
         if (TextUtils.isEmpty(path)) return;
         String name = new File(path).getName();
@@ -641,6 +657,7 @@ public class VideoActivity extends PlaybackActivity implements Clock.Callback, C
         super.initView(savedInstanceState);
         mRestoringConfigurationPlayback = savedInstanceState != null;
         startFullscreen = getIntent().getBooleanExtra("startFullscreen", false);
+        webHomeSniffer = getIntent().getBooleanExtra("webHomeSniffer", false);
         ViewCompat.setOnApplyWindowInsetsListener(mBinding.getRoot(), (v, insets) -> setStatusBar(insets));
         mKeyDown = CustomKeyDown.create(this, mBinding.exo);
         mFrameParams = mBinding.video.getLayoutParams();
@@ -793,6 +810,7 @@ public class VideoActivity extends PlaybackActivity implements Clock.Callback, C
         mBinding.shortDisplay.setOnClickListener(view -> onShortDisplay());
         mBinding.search.setOnClickListener(view -> onSearch());
         mBinding.castAction.setOnClickListener(view -> onCast());
+        if (mBinding.downloadAction != null) mBinding.downloadAction.setOnClickListener(view -> onDownload());
         mBinding.settingAction.setOnClickListener(view -> onSetting());
         mBinding.actor.setOnClickListener(view -> onActor());
         mBinding.content.setOnClickListener(view -> onContent());
@@ -1267,12 +1285,35 @@ public class VideoActivity extends PlaybackActivity implements Clock.Callback, C
     private void checkId() {
         if (getId().startsWith("push://")) getIntent().putExtra("key", SiteApi.PUSH).putExtra("id", getId().substring(7));
         if (getId().isEmpty() || getId().startsWith("msearch:")) setEmpty(false);
-        else if (!TextUtils.isEmpty(getKey()) && VodConfig.get().getSite(getKey()).isEmpty() && !SiteApi.PUSH.equals(getKey())) startCastSearch(getName());
+        else if (!TextUtils.isEmpty(getKey()) && VodConfig.get().getSite(getKey()).isEmpty() && !SiteApi.PUSH.equals(getKey()) && !WebHomeInlineVodStore.KEY.equals(getKey())) startCastSearch(getName());
         else getDetail();
+    }
+
+    // 自动全屏：进播放页默认只是预览小窗，播放起来后补一次全屏。
+    // 为什么必须延时重试 —— enterFullscreen() 开头就是
+    //   if (service() == null) { log("... player-not-ready"); return; }
+    // 播放器还没就绪时调用会被直接丢弃，所以轮询到真正进入为止。
+    // 触发条件二选一：
+    //   webHomeSniffer  -> 网页嗅探(JS) "自动播" 明确要求，无视"播放自动全屏"开关
+    //   Setting.isPlaybackAutoFullscreen() -> Java 侧发起的播放，受播放设置开关控制
+    private final Runnable mAutoFullscreen = new Runnable() {
+        int retry = 0;
+        @Override
+        public void run() {
+            if (isFinishing() || isDestroyed()) return;
+            if (isFullscreen()) return;
+            enterFullscreen();                    // 现成动作：和双击/点小窗走的是同一个
+            if (!isFullscreen() && retry++ < 5) App.post(this, 800);
+        }
+    };
+
+    private void scheduleAutoFullscreen() {
+        if (webHomeSniffer || Setting.isPlaybackAutoFullscreen()) App.post(mAutoFullscreen, 1200);
     }
 
     private void checkLand() {
         if (startFullscreen || (isPort() && ResUtil.isLand(this))) enterFullscreen();
+        scheduleAutoFullscreen();
     }
 
     private void getDetail() {
@@ -1906,13 +1947,34 @@ public class VideoActivity extends PlaybackActivity implements Clock.Callback, C
         finishPlayback();
     }
 
+    private void onDownload() {
+        if (mHistory == null || TextUtils.isEmpty(mHistory.getVodId()) || player() == null || player().isEmpty() || TextUtils.isEmpty(player().getUrl())) {
+            Notify.show(R.string.cast_not_ready);
+            return;
+        }
+        String title = mBinding.name.getText().toString();
+        String name = title + "_" + (mHistory.getVodRemarks() != null ? mHistory.getVodRemarks() : "");
+        // 写入下载目录需要文件访问权限（与项目其它落盘入口一致），无权限时先申请
+        PermissionUtil.requestFile(this, granted -> {
+            if (!granted) {
+                Notify.show(R.string.download_need_file_permission);
+                return;
+            }
+            PermissionUtil.requestNotify(this);
+            DownloadService.start(this, name, player().getUrl(), player().getHeaders());
+            Notify.show(getString(R.string.download_started));
+        });
+    }
+
     private void onCast() {
         if (mHistory == null || TextUtils.isEmpty(mHistory.getVodId()) || service() == null || player().isEmpty() || TextUtils.isEmpty(player().getUrl())) {
             Notify.show(R.string.cast_not_ready);
             return;
         }
         CastVideo video = new CastVideo(mBinding.name.getText().toString(), player().getUrl(), player().getPosition(), player().getHeaders());
-        CastDialog.create().history(mHistory).video(video).fm(true).show(this);
+        // webhome_inline 的 VOD 只在发送端内存里，远端拿 history 必然 not found；
+        // 改写成自包含的 push_agent 推送串（真实地址 + 请求头）后再发。
+        CastDialog.create().history(SiteApi.castHistory(mHistory, player().getUrl(), player().getHeaders())).video(video).fm(true).show(this);
     }
 
     private void onInfo() {

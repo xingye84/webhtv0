@@ -25,9 +25,11 @@ import com.fongmi.android.tv.utils.WebViewUtil;
 import com.github.catvod.crawler.DebugLogStore;
 import com.github.catvod.crawler.SpiderDebug;
 import com.github.catvod.utils.Trans;
+import com.github.catvod.utils.Path;
 import com.github.catvod.utils.Prefers;
 import com.google.gson.reflect.TypeToken;
 
+import java.io.File;
 import java.lang.reflect.Type;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -589,6 +591,57 @@ public class Setting {
         Prefers.put("web_home_extension", extension);
     }
 
+    public static boolean isWebHomeSniffer() {
+        return Prefers.getBoolean("web_home_sniffer", true);
+    }
+
+    public static void putWebHomeSniffer(boolean sniffer) {
+        Prefers.put("web_home_sniffer", sniffer);
+    }
+
+    public static boolean isWebHomeAdblock() {
+        return Prefers.getBoolean("web_home_adblock", true);
+    }
+
+    public static void putWebHomeAdblock(boolean adblock) {
+        Prefers.put("web_home_adblock", adblock);
+    }
+
+    /**
+     * v3.42：拦掉所有跨域导航。默认【开】。
+     *
+     * 依据：WebHome 不是浏览器，跨域导航没有合法用途 ——
+     * 看片、播视频、翻页全部在本站内完成，播放资源也是跨域「取」而非跨域「跳」。
+     * 所以默认拦掉一切跨域导航，比跟广告在 JS 层赛跑（锁时间窗 / 认热区 /
+     * 掐事件传播）既可靠又省性能。
+     *
+     * 不误伤的部分（WebHomeAdBlocker 已处理）：
+     *   · 媒体直链 .mp4/.m3u8/.jpg/... —— 是跨域「取资源」，放行
+     *   · 白名单（127.0.0.1 / localhost / 用户加白）—— 放行
+     *   · 同站跳转 —— 本来就不拦
+     *
+     * 若某个站确实需要跨域跳转（少见），在广告过滤面板里关掉此项即可。
+     */
+    public static boolean isWebHomeAdblockNav() {
+        return Prefers.getBoolean("web_home_adblock_nav", true);
+    }
+
+    public static void putWebHomeAdblockNav(boolean nav) {
+        Prefers.put("web_home_adblock_nav", nav);
+    }
+
+    /**
+     * 严格弹窗拦截：连用户手势触发的弹窗也拦。
+     * 默认关——非手势的自动弹窗始终拦截，无需此开关。
+     */
+    public static boolean isWebHomeAdblockPopup() {
+        return Prefers.getBoolean("web_home_adblock_popup", false);
+    }
+
+    public static void putWebHomeAdblockPopup(boolean popup) {
+        Prefers.put("web_home_adblock_popup", popup);
+    }
+
     public static boolean isWebHomeFullscreen() {
         return Prefers.getBoolean("web_home_fullscreen", true);
     }
@@ -603,6 +656,18 @@ public class Setting {
 
     public static void putPlaybackArtworkWall(boolean artworkWall) {
         Prefers.put("playback_artwork_wall", artworkWall);
+    }
+
+    // 播放自动全屏（播放设置 → 播放自动全屏）。
+    // 只管 App(Java) 侧发起的播放；网页嗅探(JS) "自动播" 发起的播放无视这个开关，
+    // 由 Intent extra "webHomeSniffer" 单独识别，无条件全屏。
+    // 默认关：不改变既有习惯。
+    public static boolean isPlaybackAutoFullscreen() {
+        return Prefers.getBoolean("playback_auto_fullscreen", false);
+    }
+
+    public static void putPlaybackAutoFullscreen(boolean autoFullscreen) {
+        Prefers.put("playback_auto_fullscreen", autoFullscreen);
     }
 
     public static boolean isCspWarmup() {
@@ -890,5 +955,25 @@ public class Setting {
         int count = 0;
         for (int source : SOURCE_ALL) if ((mask & source) != 0) count++;
         return count;
+    }
+
+    // ===== 下载目录配置 =====
+    /** 默认下载子目录名：tvbox/Download/ */
+    public static final String DOWNLOAD_DIR_DEFAULT = "tvbox/Download";
+
+    /** 获取当前下载目录绝对路径。未设置时返回默认路径（tvbox/Download）。 */
+    public static String getDownloadDir() {
+        String custom = Prefers.getString("download_dir", "");
+        if (custom != null && !custom.trim().isEmpty()) return custom;
+        return Path.root() + File.separator + DOWNLOAD_DIR_DEFAULT;
+    }
+
+    /** 设置自定义下载目录（绝对路径）。传 null/空串重置为默认。 */
+    public static void setDownloadDir(String absPath) {
+        if (absPath == null || absPath.trim().isEmpty()) {
+            Prefers.remove("download_dir");
+        } else {
+            Prefers.put("download_dir", absPath.trim());
+        }
     }
 }

@@ -34,6 +34,7 @@ import com.fongmi.android.tv.server.Server;
 import com.fongmi.android.tv.setting.Setting;
 import com.fongmi.android.tv.utils.KeyUtil;
 import com.fongmi.android.tv.utils.Notify;
+import com.fongmi.android.tv.utils.Sniffer;
 import com.fongmi.android.tv.utils.UrlUtil;
 import com.fongmi.android.tv.utils.Util;
 import com.fongmi.android.tv.utils.WebViewUtil;
@@ -41,6 +42,8 @@ import com.fongmi.android.tv.web.ext.WebHomeExtension;
 import com.fongmi.android.tv.web.ext.WebHomeExtensionRegistry;
 import com.google.common.net.HttpHeaders;
 import com.google.gson.JsonObject;
+
+import org.json.JSONObject;
 
 import java.util.Collections;
 import java.util.HashMap;
@@ -61,6 +64,7 @@ public class HomeWebController {
     private final Listener listener;
     private final Activity activity;
     private final Set<String> injectedExtensions;
+    private final Set<String> sniffedUrls;
     private final Runnable extensionReloadRunnable;
     private final boolean debugTools;
     private WebView webView;
@@ -94,6 +98,7 @@ public class HomeWebController {
         this.debugTools = debugTools;
         this.density = activity.getResources().getDisplayMetrics().density;
         this.injectedExtensions = new HashSet<>();
+        this.sniffedUrls = new HashSet<>();
         this.extensionReloadRunnable = this::consumeExtensionReload;
         active = this;
         init();
@@ -603,12 +608,30 @@ public class HomeWebController {
 
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                if (request == null || request.getUrl() == null) return false;
+                String target = request.getUrl().toString();
+                String page = view == null ? homePage : view.getUrl();
+                // JS 能隐藏 <a>，但挡不住 location.href= / meta refresh / 脚本重定向，这一层兜底
+                if (WebHomeAdBlocker.get().shouldBlockNavigation(page, target)) {
+                    // v3.43：统一走安全回退（先 stopLoading，再按限流决定是否 goBack）。
+                    // 直接 goBack 会重新加载上一页，若上一页脚本又自动跳转就会
+                    // 陷入「拦→回退→再跳」死循环 —— 表现是一直转圈。
+                    try {
+                        WebHomeAdBlocker.get().onNavigationBlocked(view, target);
+                    } catch (Throwable ignored) { }
+                    return true;
+                }
                 return false;
             }
 
             @Override
             public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-                listener.onWebRequest(request.getMethod(), request.getUrl().toString(), request.isForMainFrame(), request.getRequestHeaders());
+                String url = request.getUrl() == null ? "" : request.getUrl().toString();
+                Map<String, String> requestHeaders = request.getRequestHeaders();
+                listener.onWebRequest(request.getMethod(), url, request.isForMainFrame(), requestHeaders);
+                WebResourceResponse blocked = WebHomeAdBlocker.get().intercept(request);
+                if (blocked != null) return blocked;
+                pushSniffedMedia(url, request.getMethod(), requestHeaders);
                 WebResourceResponse raw = rawAdapter == null ? null : rawAdapter.intercept(request);
                 return raw == null ? super.shouldInterceptRequest(view, request) : raw;
             }
@@ -630,6 +653,28 @@ public class HomeWebController {
 
     private WebChromeClient chrome() {
         return new WebChromeClient() {
+            @Override
+            public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, android.os.Message resultMsg) {
+                // v3.50：改由 JS 面板配置判定（原先直接读 Setting，面板关了还拦）。
+                // 这里拿不到弹窗目标 URL（onCreateWindow 回调不带），所以按
+                // 「页面 + 是否用户手势」判定：
+                //   非用户手势的自动弹窗 —— 脚本发起的跨域导航，归面板的
+                //     「拦跨域跳转」/「302/跳板」开关管
+                //   用户手势触发的      —— 仅当 App 显式勾选「严格弹窗拦截」时才拦
+                String page = view == null ? null : view.getUrl();
+                if (!WebHomeAdBlocker.get().shouldBlockPopupByGesture(page, isUserGesture)) {
+                    return false;
+                }
+                SpiderDebug.log("webhome-adblock", "blocked popup gesture=%s dialog=%s", isUserGesture, isDialog);
+                if (resultMsg != null) {
+                    if (resultMsg.obj instanceof WebView.WebViewTransport) {
+                        ((WebView.WebViewTransport) resultMsg.obj).setWebView(null);
+                    }
+                    resultMsg.sendToTarget();
+                }
+                return true;
+            }
+
             @Override
             public boolean onConsoleMessage(ConsoleMessage message) {
                 if (message != null) {
@@ -661,8 +706,74 @@ public class HomeWebController {
         });
     }
 
+    /**
+     * 原生层媒体嗅探：把 shouldInterceptRequest 命中媒体的请求推给 WebHome 页面。
+     * 只推送不拦截，对页面零副作用；JS 侧由 __fmNativeSniff / __fmNativeSniffQ 接收。
+     */
+    private void pushSniffedMedia(String url, String method, Map<String, String> requestHeaders) {
+        if (!Setting.isWebHomeSniffer()) return;
+        if (TextUtils.isEmpty(url) || !Sniffer.isVideoFormat(url)) return;
+        if (!sniffedUrls.add(url)) return;
+        if (webView == null) return;
+        try {
+            JSONObject headers = new JSONObject();
+            if (requestHeaders != null) {
+                for (Map.Entry<String, String> entry : requestHeaders.entrySet()) {
+                    String key = entry.getKey();
+                    String value = entry.getValue();
+                    if (key == null || value == null) continue;
+                    String lower = key.toLowerCase();
+                    // Cookie 交给播放侧 credentials:include 补齐，避免重复携带
+                    if ("cookie".equals(lower) || "host".equals(lower) || "content-length".equals(lower)) continue;
+                    headers.put(key, value);
+                }
+            }
+            JSONObject payload = new JSONObject();
+            payload.put("url", url);
+            payload.put("method", method == null ? "GET" : method);
+            payload.put("headers", headers);
+            String script = "(function(){try{var p=" + payload + ";"
+                    + "if(window.__fmNativeSniff){window.__fmNativeSniff(p);}"
+                    + "else{(window.__fmNativeSniffQ=window.__fmNativeSniffQ||[]).push(p);}"
+                    + "}catch(e){}})()";
+            webView.post(() -> {
+                try {
+                    webView.evaluateJavascript(script, null);
+                } catch (Throwable ignored) {
+                }
+            });
+            SpiderDebug.log("webhome-sniffer", "hit url=%s method=%s", url, method);
+        } catch (Throwable e) {
+            SpiderDebug.log("webhome-sniffer", "push failed url=%s error=%s", url, e.getMessage());
+        }
+    }
+
+    /**
+     * 页面切换时清空去重集合，避免跨页漏报。
+     */
+    private void resetSniffedMedia() {
+        try {
+            sniffedUrls.clear();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * 在每个文档最开始预置接收队列，避免扩展脚本注入前的请求丢失。
+     */
+    private void registerSniffQueueScript() {
+        if (webView == null || !isDocumentStartSupported()) return;
+        try {
+            WebViewCompat.addDocumentStartJavaScript(webView, "window.__fmNativeSniffQ=window.__fmNativeSniffQ||[];", Collections.singleton("*"));
+        } catch (Throwable e) {
+            SpiderDebug.log("webhome-sniffer", "queue script register failed error=%s", e.getMessage());
+        }
+    }
+
     private void registerDocumentStartScripts() {
         removeDocumentStartScripts();
+        resetSniffedMedia();
+        registerSniffQueueScript();
         if (site == null || !isDocumentStartSupported()) return;
         String script = documentStartScript();
         if (TextUtils.isEmpty(script)) return;

@@ -61,7 +61,6 @@ import com.google.gson.JsonObject;
 import org.greenrobot.eventbus.Subscribe;
 import org.greenrobot.eventbus.ThreadMode;
 
-import java.util.Arrays;
 import java.util.List;
 
 public class HomeActivity extends BaseActivity implements NavigationBarView.OnItemSelectedListener, WebHomeChromeController.Host {
@@ -206,7 +205,15 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
                 break;
             case Setting.DEFAULT_LAUNCH_RECENT:
                 List<History> history = History.get();
-                if (!history.isEmpty()) VideoActivity.startFullscreen(this, history.get(0));
+                if (!history.isEmpty()) {
+                    History first = history.get(0);
+                    String siteKey = first.getSiteKey();
+                    Task.execute(() -> {
+                        Site site = VodConfig.get().getSite(siteKey);
+                        if (!site.isEmpty()) site.spider();
+                        App.post(() -> VideoActivity.startFullscreen(this, first));
+                    });
+                }
                 break;
             default:
                 break;
@@ -283,7 +290,7 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
 
     @Subscribe(threadMode = ThreadMode.MAIN)
     public void onServerEvent(ServerEvent event) {
-        if (event.type() == ServerEvent.Type.PUSH) VideoActivity.push(this, event.text());
+        if (event.type() == ServerEvent.Type.PUSH) VideoActivity.push(this, event.text(), event.name());
         if (event.type() == ServerEvent.Type.SEARCH) SearchActivity.start(this, event.text());
     }
 

@@ -152,6 +152,7 @@ import com.fongmi.android.tv.utils.Sniffer;
 import com.fongmi.android.tv.utils.Task;
 import com.fongmi.android.tv.utils.Traffic;
 import com.fongmi.android.tv.utils.Util;
+import com.fongmi.android.tv.web.WebHomeInlineVodStore;
 import com.github.catvod.crawler.SpiderDebug;
 import com.github.bassaer.library.MDColor;
 import com.google.android.material.bottomsheet.BottomSheetBehavior;
@@ -269,6 +270,7 @@ public class VideoActivity extends PlaybackActivity implements CustomKeyDownVod.
     private History mHistory;
     private boolean fullscreen;
     private boolean startFullscreen;
+    private boolean webHomeSniffer;
     private boolean mWasPlaying;
     private boolean initAuto;
     private boolean autoMode;
@@ -365,10 +367,21 @@ public class VideoActivity extends PlaybackActivity implements CustomKeyDownVod.
     });
 
     public static void push(FragmentActivity activity, String text) {
-        if (FileChooser.isValid(activity, Uri.parse(text))) file(activity, FileChooser.getPathFromUri(Uri.parse(text)));
-        else start(activity, Sniffer.getUrl(text));
+        push(activity, text, "");
     }
-
+ 
+    public static void push(FragmentActivity activity, String text, String name) {
+        if (TextUtils.isEmpty(text)) return;
+        if (FileChooser.isValid(activity, Uri.parse(text))) {
+            file(activity, FileChooser.getPathFromUri(Uri.parse(text)));
+            return;
+        }
+        // 带请求头的推送串（url@Headers=<json>）不能被正则截断，整串交给 PUSH 链路解析
+        String url = text.contains(Sniffer.HEADERS_TAG) ? text : Sniffer.getUrl(text);
+        if (TextUtils.isEmpty(url)) return;
+        start(activity, SiteApi.PUSH, url, TextUtils.isEmpty(name) ? Sniffer.pushUrl(url) : name);
+    }
+ 
     public static void file(FragmentActivity activity, String path) {
         if (TextUtils.isEmpty(path)) return;
         String name = new File(path).getName();
@@ -515,8 +528,19 @@ public class VideoActivity extends PlaybackActivity implements CustomKeyDownVod.
         return episode.getName().concat("|").concat(episode.getUrl());
     }
 
+    /** OSD 左上角标题。
+     *
+     *  注意：OSD 与控制面板是两套渲染 —— 控制面板可见时 PlayerOsdController.render()
+     *  会把整个 OSD root 置 GONE 并直接 return，左上角显示的是控制面板自己的标题。
+     *  所以「控制面板标题正确、OSD 标题错误」并不是同一处数据的两种表现，而是两个数据源：
+     *  控制面板的标题由 updateVod() 用详情返回的真实片名刷新过，而 OSD 一直读的是
+     *  getName()（intent 里的启动快照）。这里改为优先取界面上已确认的片名，
+     *  详情回来后 OSD 会在下一次 render（每秒一次）自动纠偏。 */
     private String getOsdTitle() {
         String name = getName();
+        CharSequence shown = mBinding == null ? null : mBinding.name.getText();
+        if (!TextUtils.isEmpty(shown)) name = shown.toString();
+        else if (mHistory != null && !TextUtils.isEmpty(mHistory.getVodName())) name = mHistory.getVodName();
         if (mEpisodeAdapter == null || mEpisodeAdapter.getItemCount() == 0) return name;
         String episode = Objects.toString(getEpisode().getName(), "");
         if (TextUtils.isEmpty(episode) || TextUtils.equals(name, episode)) return name;
@@ -567,6 +591,26 @@ public class VideoActivity extends PlaybackActivity implements CustomKeyDownVod.
         return mBinding.control.seek;
     }
 
+    // 自动全屏：进播放页默认只是预览小窗，播放起来后补一次全屏。
+    // 触发条件二选一：
+    //   webHomeSniffer  -> 网页嗅探(JS) "自动播" 明确要求，无视"播放自动全屏"开关
+    //   Setting.isPlaybackAutoFullscreen() -> Java 侧发起的播放，受播放设置开关控制
+    // 延时重试是必须的：播放器还没就绪时 enterFullscreen() 可能被丢弃。
+    private final Runnable mAutoFullscreen = new Runnable() {
+        int retry = 0;
+        @Override
+        public void run() {
+            if (isFinishing() || isDestroyed()) return;
+            if (isFullscreen()) return;
+            enterFullscreen();                    // 现成动作：和点小窗走的是同一个
+            if (!isFullscreen() && retry++ < 5) App.post(this, 800);
+        }
+    };
+
+    private void scheduleAutoFullscreen() {
+        if (webHomeSniffer || Setting.isPlaybackAutoFullscreen()) App.post(mAutoFullscreen, 1200);
+    }
+
     @Override
     protected void onServiceConnected() {
         SpiderDebug.log("video-flow", "service ready sinceLaunch=%dms key=%s id=%s", getLaunchCost(System.currentTimeMillis()), getKey(), getId());
@@ -575,6 +619,7 @@ public class VideoActivity extends PlaybackActivity implements CustomKeyDownVod.
         setDecode();
         setLut();
         if ((startFullscreen || isCast()) && !isFullscreen()) enterFullscreen();
+        scheduleAutoFullscreen();
         if (!detailRequested) checkId();
         if (mPendingDetail != null) {
             Result result = mPendingDetail;
@@ -609,6 +654,7 @@ public class VideoActivity extends PlaybackActivity implements CustomKeyDownVod.
         long start = System.currentTimeMillis();
         SpiderDebug.log("video-flow", "initView start sinceLaunch=%dms key=%s id=%s", getLaunchCost(start), getKey(), getId());
         startFullscreen = getIntent().getBooleanExtra("startFullscreen", false);
+        webHomeSniffer = getIntent().getBooleanExtra("webHomeSniffer", false);
         if (!isCast() && hasInitialPreview()) showInitialPreview();
         super.initView(savedInstanceState);
         SpiderDebug.log("video-flow", "initView after playback cost=%dms", System.currentTimeMillis() - start);
@@ -1105,7 +1151,7 @@ public class VideoActivity extends PlaybackActivity implements CustomKeyDownVod.
         detailRequested = true;
         if (getId().startsWith("push://")) getIntent().putExtra("key", SiteApi.PUSH).putExtra("id", getId().substring(7));
         if (getId().isEmpty() || getId().startsWith("msearch:")) setEmpty(false);
-        else if (!TextUtils.isEmpty(getKey()) && VodConfig.get().getSite(getKey()).isEmpty() && !SiteApi.PUSH.equals(getKey())) startCastSearch(getName());
+        else if (!TextUtils.isEmpty(getKey()) && VodConfig.get().getSite(getKey()).isEmpty() && !SiteApi.PUSH.equals(getKey()) && !WebHomeInlineVodStore.KEY.equals(getKey())) startCastSearch(getName());
         else getDetail();
     }
 
@@ -1180,6 +1226,9 @@ public class VideoActivity extends PlaybackActivity implements CustomKeyDownVod.
         item.checkPic(getPic());
         item.checkName(getName());
         item.checkContent(getContent());
+        // 详情拿到真实片名后同步回 intent：getName() 是启动时传入的快照，
+        // 不回写的话 OSD 左上角标题、换站搜索兜底等都会一直用那个可能已过期的名字
+        if (!item.getName().isEmpty()) getIntent().putExtra("name", item.getName());
         mBinding.progressLayout.showContent();
         mBinding.name.setText(item.getName());
         mFlagAdapter.addAll(item.getFlags());
@@ -1822,7 +1871,9 @@ public class VideoActivity extends PlaybackActivity implements CustomKeyDownVod.
             return;
         }
         CastVideo video = new CastVideo(Objects.toString(mBinding.widget.title.getText(), ""), player().getUrl(), player().getPosition(), player().getHeaders());
-        CastDialog.create().history(mHistory).video(video).fm(true).show(this);
+        // webhome_inline 的 VOD 只在发送端内存里，远端拿 history 必然 not found；
+        // 改写成自包含的 push_agent 推送串（真实地址 + 请求头）后再发。
+        CastDialog.create().history(SiteApi.castHistory(mHistory, player().getUrl(), player().getHeaders())).video(video).fm(true).show(this);
     }
 
     private void onTimer() {
@@ -3781,7 +3832,12 @@ public class VideoActivity extends PlaybackActivity implements CustomKeyDownVod.
 
     private void checkHistory(Vod item) {
         mHistory = History.find(getHistoryKey());
+        boolean fromDb = mHistory != null;
         mHistory = mHistory == null ? createHistory(item) : mHistory;
+        // 诊断用：intent 里带的启动片名 vs 详情返回的权威片名。
+        // 两者不一致 = 启动时那条历史的 vodName 是脏的（DB 里 key 与 name 不匹配）。
+        SpiderDebug.log("video-flow", "checkHistory fromDb=%s intentName=%s detailName=%s historyName=%s",
+                fromDb, getName(), item.getName(), mHistory.getVodName());
         applyCastHistory();
         if (!TextUtils.isEmpty(getWallPic())) mHistory.setWallPic(getWallPic());
         if (!TextUtils.isEmpty(getMark())) mHistory.setVodRemarks(getMark());
@@ -3794,6 +3850,9 @@ public class VideoActivity extends PlaybackActivity implements CustomKeyDownVod.
         mBinding.control.action.speed.setText(player().setSpeed(PlayerSetting.getDefaultSpeed()));
         mHistory.setSpeed(player().getSpeed());
         mHistory.setVodName(item.getName());
+        // 详情是权威片名，回写 intent：getName() 是启动时传入的快照，
+        // 不回写的话 OSD 左上角会一直停在启动时的旧名字
+        if (!TextUtils.isEmpty(item.getName())) getIntent().putExtra("name", item.getName());
         PlaybackEventCollector.get().updateHistory(mHistory);
         setArtwork(getInitialArtwork(item));
         setScale(getScale());
@@ -3931,6 +3990,7 @@ public class VideoActivity extends PlaybackActivity implements CustomKeyDownVod.
         boolean name = !item.getName().isEmpty();
         if (id) getIntent().putExtra("id", item.getId());
         if (id) mHistory.replace(getHistoryKey());
+        if (name) getIntent().putExtra("name", item.getName());   // 同上：真实片名回写，OSD 才不会停留在启动时的旧值
         if (name) mHistory.setVodName(item.getName());
         if (name) mBinding.name.setText(item.getName());
         if (name) mBinding.widget.title.setText(item.getName());

@@ -1,6 +1,7 @@
 package com.fongmi.android.tv.web;
 
 import android.app.Activity;
+import android.content.Intent;
 import android.text.TextUtils;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebView;
@@ -105,6 +106,42 @@ public class HomeWebBridge {
         if (future != null) future.complete(payload);
     }
 
+    /**
+     * v3.42：接收 JS 广告过滤脚本同步的配置。
+     * payload: {"siteHost":"a6.com","blockAllCrossNav":true,"allowCrossNav":false,
+     *           "blacklist":["ec766.com","ucloudqn.unipus.cn"]}
+     */
+    private String adblockConfig(JsonObject payload) {
+        try {
+            // v3.44：完整接收开关 + 白名单 + 黑名单。
+            // 之前只取 siteHost / blacklist，开关值没传给 Java ——
+            // shouldBlockNavigation 只能读 Setting 默认值，
+            // 面板里改开关不生效。
+            boolean enabled = payload.has("enabled") ? payload.get("enabled").getAsBoolean() : true;
+            String host = Json.safeString(payload, "siteHost");
+            boolean blockAll = payload.has("blockAllCrossNav") ? payload.get("blockAllCrossNav").getAsBoolean() : true;
+            boolean allowCross = payload.has("allowCrossNav") ? payload.get("allowCrossNav").getAsBoolean() : false;
+            // v3.48：302/跳板重定向（原生兜底）开关，默认开
+            boolean blockNavJump = payload.has("blockNavJump") ? payload.get("blockNavJump").getAsBoolean() : true;
+            java.util.List<String> white = asList(payload, "whitelist");
+            java.util.List<String> black = asList(payload, "blacklist");
+            String scope = payload.has("scope") ? payload.get("scope").getAsString() : "global";
+            WebHomeAdBlocker.get().applyJsConfig(enabled, host, blockAll, allowCross, blockNavJump, white, black, scope);
+        } catch (Throwable ignored) { }
+        return quote("ok");
+    }
+
+    private static java.util.List<String> asList(JsonObject obj, String key) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try {
+            com.google.gson.JsonArray arr = obj.getAsJsonArray(key);
+            if (arr != null) {
+                for (int i = 0; i < arr.size(); i++) out.add(arr.get(i).getAsString());
+            }
+        } catch (Throwable ignored) { }
+        return out;
+    }
+
     private void handle(String requestId, String method, JsonObject payload) {
         try {
             SpiderDebug.log("webhome", "invoke method=%s payload=%s", method, payload);
@@ -131,6 +168,9 @@ public class HomeWebBridge {
                 case "device.info" -> device();
                 case "site.info" -> site();
                 case "config.info" -> config();
+                // v3.42：JS 广告过滤脚本同步站点主域与黑名单到原生层，
+                // 让 shouldOverrideUrlLoading 能据此拦跨域导航
+                case "adblock.config" -> adblockConfig(payload);
                 case "ext.info" -> extInfo();
                 case "ext.log" -> extLog(payload);
                 case "ext.toast" -> extToast(payload);
@@ -160,8 +200,25 @@ public class HomeWebBridge {
         final String playPic = pic;
         final String playWall = wall;
         final String playContent = content;
-        SpiderDebug.log("webhome", "player.playUrl title=%s url=%s", playTitle, playUrl);
-        App.post(() -> VideoActivity.start(activity, SiteApi.PUSH, playUrl, playTitle, playPic, null, playWall, playContent));
+        // 网关路径同样要带 webHomeSniffer 标记（JS 侧"自动播"勾选时 fullscreen=true）。
+        // 自己组 Intent 而不是调 VideoActivity.start(...)，理由同 playVodInline：
+        // 两端 start 签名不同，main 目录直接引用会让另一个 flavor 编译失败。
+        final boolean wantFullscreen = payload.has("fullscreen") && payload.get("fullscreen").getAsBoolean();
+        SpiderDebug.log("webhome", "player.playUrl title=%s url=%s fullscreen=%s", playTitle, playUrl, wantFullscreen);
+        App.post(() -> {
+            ImgUtil.preload(activity, playPic);
+            if (Setting.isPlaybackArtworkWall() && !TextUtils.isEmpty(playWall) && !TextUtils.equals(playWall, playPic)) ImgUtil.preload(activity, playWall);
+            Intent intent = new Intent(activity, VideoActivity.class);
+            intent.putExtra("key", SiteApi.PUSH);
+            intent.putExtra("id", playUrl);
+            intent.putExtra("name", playTitle);
+            intent.putExtra("pic", playPic);
+            intent.putExtra("wallPic", playWall);
+            intent.putExtra("content", playContent);
+            intent.putExtra("collect", false);
+            intent.putExtra("webHomeSniffer", wantFullscreen);
+            activity.startActivity(intent);
+        });
         return "{}";
     }
 
@@ -190,8 +247,33 @@ public class HomeWebBridge {
         final String playMark = mark;
         final String playWall = wall;
         final String playContent = content;
-        SpiderDebug.log("webhome", "player.playVodInline title=%s id=%s mark=%s", playTitle, vodId, playMark);
-        App.post(() -> VideoActivity.start(activity, WebHomeInlineVodStore.KEY, vodId, playTitle, playPic, playMark, playWall, playContent));
+        // 网页嗅探(JS) 侧发起的播放：JS 没有全屏接口，只能把 fullscreen 塞进 payload。
+        // 这里转成 Intent extra "webHomeSniffer" 交给 VideoActivity：
+        //   true  -> JS 明确要求全屏（面板"自动播"勾选时），无视"播放自动全屏"开关
+        //   false -> 手动点的，交给"播放自动全屏"开关决定
+        // 为什么不调 VideoActivity.start(..., fullscreen)：
+        //   mobile 是 10 参，leanback 是 11 参（多一个 boolean cast），
+        //   HomeWebBridge 在 main 目录，编译期只能看见当前 flavor 的签名，
+        //   直接引用必然让另一个 flavor 编译失败。自己组 Intent 就没这个问题。
+        // 也不再写 "startFullscreen"：那个 extra 在 onServiceConnected 里只判一次，
+        // 播放器还没就绪时会被 enterFullscreen() 开头的 service()==null 直接丢弃。
+        final boolean wantFullscreen = payload.has("fullscreen") && payload.get("fullscreen").getAsBoolean();
+        SpiderDebug.log("webhome", "player.playVodInline title=%s id=%s mark=%s fullscreen=%s", playTitle, vodId, playMark, wantFullscreen);
+        App.post(() -> {
+            ImgUtil.preload(activity, playPic);
+            if (Setting.isPlaybackArtworkWall() && !TextUtils.isEmpty(playWall) && !TextUtils.equals(playWall, playPic)) ImgUtil.preload(activity, playWall);
+            Intent intent = new Intent(activity, VideoActivity.class);
+            intent.putExtra("key", WebHomeInlineVodStore.KEY);
+            intent.putExtra("id", vodId);
+            intent.putExtra("name", playTitle);
+            intent.putExtra("pic", playPic);
+            intent.putExtra("mark", playMark);
+            intent.putExtra("wallPic", playWall);
+            intent.putExtra("content", playContent);
+            intent.putExtra("collect", false);
+            intent.putExtra("webHomeSniffer", wantFullscreen);
+            activity.startActivity(intent);
+        });
         JsonObject result = new JsonObject();
         result.addProperty("siteKey", WebHomeInlineVodStore.KEY);
         result.addProperty("vodId", vodId);
