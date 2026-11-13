@@ -13,7 +13,9 @@ import androidx.leanback.widget.FocusHighlight;
 import androidx.leanback.widget.HorizontalGridView;
 import androidx.leanback.widget.ItemBridgeAdapter;
 import androidx.leanback.widget.ListRow;
+import androidx.leanback.widget.ListRowPresenter;
 import androidx.lifecycle.ViewModelProvider;
+import androidx.recyclerview.widget.RecyclerView;
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout;
 import androidx.viewbinding.ViewBinding;
 
@@ -30,6 +32,7 @@ import com.fongmi.android.tv.bean.Vod;
 import com.fongmi.android.tv.databinding.FragmentTypeBinding;
 import com.fongmi.android.tv.model.SiteViewModel;
 import com.fongmi.android.tv.ui.activity.CollectActivity;
+import com.fongmi.android.tv.ui.activity.HistoryResumeCoordinator;
 import com.fongmi.android.tv.ui.activity.HomeActivity;
 import com.fongmi.android.tv.ui.activity.VideoActivity;
 import com.fongmi.android.tv.ui.base.BaseFragment;
@@ -55,16 +58,26 @@ public class TypeFragment extends BaseFragment implements CustomScroller.Callbac
     private CustomScroller mScroller;
     private SiteViewModel mViewModel;
     private List<Filter> mFilters;
+    private Integer pendingContentRow;
+    private int contentFocusGeneration;
+    private int scrollGeneration;
     private boolean headerVisible;
     private boolean filterVisible;
 
     public static TypeFragment newInstance(String key, String typeId, Style style, HashMap<String, String> extend, boolean folder) {
+        return newInstance(key, typeId, style, extend, folder, -1, null, -1);
+    }
+
+    public static TypeFragment newInstance(String key, String typeId, Style style, HashMap<String, String> extend, boolean folder, int historyResumeCid, String historyResumeKey, int historyResumeTargetCid) {
         Bundle args = new Bundle();
         args.putString("key", key);
         args.putString("typeId", typeId);
         args.putBoolean("folder", folder);
         args.putParcelable("style", style);
         args.putSerializable("extend", extend);
+        args.putInt("historyResumeCid", historyResumeCid);
+        args.putString("historyResumeKey", historyResumeKey);
+        args.putInt("historyResumeTargetCid", historyResumeTargetCid);
         TypeFragment fragment = new TypeFragment();
         fragment.setArguments(args);
         return fragment;
@@ -80,6 +93,22 @@ public class TypeFragment extends BaseFragment implements CustomScroller.Callbac
 
     private boolean isFolder() {
         return getArguments().getBoolean("folder");
+    }
+
+    private int getHistoryResumeCid() {
+        return getArguments().getInt("historyResumeCid", -1);
+    }
+
+    private String getHistoryResumeKey() {
+        return getArguments().getString("historyResumeKey");
+    }
+
+    private int getHistoryResumeTargetCid() {
+        return getArguments().getInt("historyResumeTargetCid", -1);
+    }
+
+    private boolean isHistoryResume() {
+        return getHistoryResumeCid() >= 0 && getHistoryResumeTargetCid() >= 0 && getHistoryResumeKey() != null && !getHistoryResumeKey().isEmpty();
     }
 
     private Style getStyle() {
@@ -128,10 +157,11 @@ public class TypeFragment extends BaseFragment implements CustomScroller.Callbac
     private void setRecyclerView() {
         CustomSelector selector = new CustomSelector();
         selector.addPresenter(Vod.class, new VodPresenter(this, Style.list()));
-        selector.addPresenter(ListRow.class, new CustomRowPresenter(16), VodPresenter.class);
-        selector.addPresenter(ListRow.class, new CustomRowPresenter(8, FocusHighlight.ZOOM_FACTOR_NONE, HorizontalGridView.FOCUS_SCROLL_ALIGNED), FilterPresenter.class);
+        selector.addPresenter(ListRow.class, new CustomRowPresenter(ResUtil.dpOf(R.dimen.webhtv_size_tv_card_gap), this::onContentHorizontalEdge), VodPresenter.class);
+        selector.addPresenter(ListRow.class, new CustomRowPresenter(8, FocusHighlight.ZOOM_FACTOR_NONE, HorizontalGridView.FOCUS_SCROLL_ALIGNED, true), FilterPresenter.class);
         mBinding.recycler.setAdapter(new ItemBridgeAdapter(mAdapter = new ArrayObjectAdapter(selector)));
-        mBinding.recycler.setHeader(getActivity(), R.id.recycler);
+        mBinding.recycler.setHeader(getActivity(), getParent().getScrollHeaderIds());
+        mBinding.recycler.setHeaderVisibilityListener(getParent()::onScrollHeaderVisibilityChanged);
         mBinding.recycler.setVerticalSpacing(ResUtil.dp2px(16));
     }
 
@@ -181,7 +211,10 @@ public class TypeFragment extends BaseFragment implements CustomScroller.Callbac
         mBinding.progressLayout.showContent(first & flag, size);
         mBinding.swipeLayout.setRefreshing(false);
         mScroller.endLoading(result);
-        if (size > 0) addVideo(result);
+        if (size > 0) {
+            addVideo(result);
+            applyPendingContentFocus();
+        }
         if ("home".equals(getTypeId()) && HomeActivity.sPendingVideo != null) {
             Vod pending = HomeActivity.sPendingVideo;
             HomeActivity.sPendingVideo = null;
@@ -257,6 +290,29 @@ public class TypeFragment extends BaseFragment implements CustomScroller.Callbac
         else mBinding.swipeLayout.setRefreshing(true);
     }
 
+    public boolean resetFilter() {
+        if (mFilters.isEmpty()) return false;
+        boolean changed = !mExtends.isEmpty();
+        for (Filter filter : mFilters) {
+            for (Value value : filter.getValue()) {
+                if (value.isSelected()) changed = true;
+                value.setSelected(false);
+            }
+        }
+        mExtends.clear();
+        if (changed) {
+            // Rebuilding the rows is what makes the chips render as unselected; skip it when
+            // nothing was selected so a no-op long press does not scroll the panel back to row 0.
+            if (filterVisible) {
+                hideFilter();
+                showFilter();
+            }
+            onRefresh();
+            Notify.show(R.string.filter_reset);
+        }
+        return changed;
+    }
+
     public void onRefresh() {
         getVideo();
     }
@@ -264,13 +320,20 @@ public class TypeFragment extends BaseFragment implements CustomScroller.Callbac
     @Override
     public void onItemClick(Vod item) {
         if (item.isAction()) {
-            mViewModel.action(getKey(), item.getAction());
+            com.fongmi.android.tv.content.ActionCardHelper.handleAction(requireActivity(), getKey(), item.getAction());
         } else if (item.isFolder()) {
             getParent().openFolder(item.getId(), mExtends);
             headerVisible = mBinding.recycler.isHeaderVisible();
         } else {
-            if (getSite().isIndex()) CollectActivity.start(requireActivity(), item.getName());
-            else VideoActivity.start(requireActivity(), getKey(), item.getId(), item.getName(), item.getPic(), isFolder() ? item.getName() : null);
+            if (getSite().isIndex()) {
+                if (isHistoryResume()) HistoryResumeCoordinator.openSearch(requireActivity(), getHistoryResumeCid(), getHistoryResumeKey(), getHistoryResumeTargetCid(), item.getName());
+                else CollectActivity.start(requireActivity(), item.getName());
+            } else if (isHistoryResume()) {
+                item.setSite(getSite());
+                HistoryResumeCoordinator.openSelected(requireActivity(), getHistoryResumeCid(), getHistoryResumeKey(), getHistoryResumeTargetCid(), item);
+            } else {
+                VideoActivity.start(requireActivity(), getKey(), item.getId(), item.getName(), item.getPic(), isFolder() ? item.getName() : null);
+            }
         }
     }
 
@@ -291,12 +354,25 @@ public class TypeFragment extends BaseFragment implements CustomScroller.Callbac
     public void onHiddenChanged(boolean hidden) {
         super.onHiddenChanged(hidden);
         if (hidden) {
+            scrollGeneration++;
+            contentFocusGeneration++;
+            pendingContentRow = null;
             mBinding.recycler.showHeader();
         } else {
             if (headerVisible) mBinding.recycler.showHeader();
             else mBinding.recycler.hideHeader();
             mBinding.recycler.requestFocus();
+            applyPendingContentFocus();
         }
+    }
+
+    private void onContentHorizontalEdge(boolean towardEnd) {
+        int contentRow = getContentRow();
+        if (contentRow >= 0) getParent().onContentHorizontalEdge(contentRow, towardEnd);
+    }
+
+    private int getContentRow() {
+        return mBinding.recycler.getSelectedPosition() - (filterVisible ? mFilters.size() : 0);
     }
 
     public boolean requestContentFocus() {
@@ -305,6 +381,72 @@ public class TypeFragment extends BaseFragment implements CustomScroller.Callbac
         if (child == null && mBinding.recycler.getChildCount() > 0) child = mBinding.recycler.getChildAt(0);
         if (child != null) return child.requestFocus();
         return mBinding.recycler.requestFocus();
+    }
+
+    public void scrollContentToTop() {
+        scrollContentToTop(++scrollGeneration);
+    }
+
+    public void scrollContentToTop(int generation) {
+        if (mBinding == null || mAdapter == null) return;
+        int target = filterVisible ? mFilters.size() : 0;
+        scrollGeneration = generation;
+        mBinding.recycler.post(() -> {
+            if (generation != scrollGeneration || mBinding == null || mAdapter == null || mAdapter.size() <= target || !isVisible() || getParentFragment() == null || !getParentFragment().isVisible()) return;
+            mBinding.recycler.showHeader();
+            mBinding.recycler.scrollToPosition(target);
+        });
+    }
+
+    public void requestContentFocus(int contentRow) {
+        requestContentFocus(contentRow, contentFocusGeneration + 1);
+    }
+
+    public void requestContentFocus(int contentRow, int generation) {
+        pendingContentRow = Math.max(0, contentRow);
+        contentFocusGeneration = generation;
+        applyPendingContentFocus();
+    }
+
+    public void clearContentFocusRequest() {
+        pendingContentRow = null;
+        contentFocusGeneration++;
+        scrollGeneration++;
+    }
+
+    private void applyPendingContentFocus() {
+        if (pendingContentRow == null || mBinding == null || mAdapter == null || !mBinding.progressLayout.isContent()) return;
+        if (!isVisible() || getParentFragment() == null || !getParentFragment().isVisible()) return;
+        int filterOffset = filterVisible ? mFilters.size() : 0;
+        int contentCount = mAdapter.size() - filterOffset;
+        if (contentCount <= 0) return;
+        int target = filterOffset + Math.min(pendingContentRow, contentCount - 1);
+        int generation = contentFocusGeneration;
+        pendingContentRow = null;
+        mBinding.recycler.showHeader();
+        mBinding.recycler.setSelectedPosition(target, holder -> focusFirstCard(holder, generation));
+    }
+
+    private void focusFirstCard(RecyclerView.ViewHolder holder, int generation) {
+        if (generation != contentFocusGeneration || !isVisible() || getParentFragment() == null || !getParentFragment().isVisible()) return;
+        if (holder instanceof ItemBridgeAdapter.ViewHolder bridge && bridge.getViewHolder() instanceof ListRowPresenter.ViewHolder row) {
+            HorizontalGridView grid = row.getGridView();
+            if (grid.getAdapter() != null && grid.getAdapter().getItemCount() > 0) {
+                grid.setSelectedPosition(0, item -> {
+                    if (generation == contentFocusGeneration && isVisible() && getParentFragment() != null && getParentFragment().isVisible()) item.itemView.requestFocus();
+                });
+                return;
+            }
+        }
+        holder.itemView.requestFocus();
+    }
+
+    @Override
+    public void onDestroyView() {
+        pendingContentRow = null;
+        contentFocusGeneration++;
+        scrollGeneration++;
+        super.onDestroyView();
     }
 
 }

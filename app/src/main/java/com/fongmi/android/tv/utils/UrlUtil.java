@@ -6,8 +6,6 @@ import com.fongmi.android.tv.server.Server;
 import com.github.catvod.utils.UriUtil;
 import com.google.common.net.HttpHeaders;
 
-import java.io.File;
-
 public class UrlUtil {
 
     public static Uri uri(String url) {
@@ -53,13 +51,7 @@ public class UrlUtil {
         if ("assets".equals(scheme)) path = "/";
         else if ("file".equals(scheme)) path = "/file/";
         else if ("proxy".equals(scheme)) path = "/proxy?";
-        return path != null ? url.replace(scheme + "://", Server.get().getAddress(path)) : url;
-    }
-
-    public static File toLocalFile(String url) {
-        if (url == null) return null;
-        if (url.startsWith("http") || url.startsWith("content")) return null;
-        return com.github.catvod.utils.Path.local(url);
+        return path != null ? url.replace(scheme + "://", Server.get().getAddress(path)) : GithubProxy.apply(url);
     }
 
     public static String getName(String url) {
@@ -67,6 +59,12 @@ public class UrlUtil {
         String path = path(uri);
         String host = host(uri);
         return !path.isEmpty() ? path : !host.isEmpty() ? host : url;
+    }
+
+    public static java.io.File toLocalFile(String url) {
+        if (url == null) return null;
+        if (url.startsWith("http") || url.startsWith("content")) return null;
+        return com.github.catvod.utils.Path.local(url);
     }
 
     public static String fixHeader(String key) {

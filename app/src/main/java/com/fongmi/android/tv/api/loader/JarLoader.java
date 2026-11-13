@@ -16,11 +16,15 @@ import org.json.JSONObject;
 
 import java.io.File;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Supplier;
 
 import dalvik.system.DexClassLoader;
 import okhttp3.OkHttpClient;
@@ -28,6 +32,18 @@ import okhttp3.Request;
 import okhttp3.Response;
 
 public class JarLoader {
+
+    private static final int SPIDER_INIT_ATTEMPTS = 2;
+
+    /**
+     * On translated runtimes (x86 emulator executing arm64 native code) ART's
+     * {@code UnloadNativeLibraries()} calls into the binary translator and can
+     * SIGSEGV from {@code HeapTaskDaemon}. Dropping a replaced
+     * {@code DexClassLoader} therefore crashed the app on every interface
+     * reload. Retiring the loader keeps it strongly reachable for the process
+     * lifetime on those devices only, which skips the unsafe unload path.
+     */
+    private static final List<DexClassLoader> RETAINED_ON_TRANSLATED_RUNTIME = new ArrayList<>();
 
     private final ConcurrentHashMap<String, DexClassLoader> loaders;
     private final ConcurrentHashMap<String, Method> methods;
@@ -44,12 +60,26 @@ public class JarLoader {
 
     public void clear() {
         SpiderDebug.log("jar-loader", "clear loaders=%s spiders=%s methods=%s", loaders.size(), spiders.size(), methods.size());
-        spiders.values().forEach(Spider::destroy);
-        loaders.clear();
-        methods.clear();
-        spiders.clear();
-        locks.clear();
-        recent = null;
+        try {
+            SpiderCleanup.destroy("jar-loader", spiders);
+        } finally {
+            retireLoaders();
+            loaders.clear();
+            methods.clear();
+            spiders.clear();
+            locks.clear();
+            recent = null;
+        }
+    }
+
+    private void retireLoaders() {
+        if (loaders.isEmpty()) return;
+        if (!NativeBridgeGuard.isTranslatedRuntime()) return;
+        synchronized (RETAINED_ON_TRANSLATED_RUNTIME) {
+            RETAINED_ON_TRANSLATED_RUNTIME.addAll(loaders.values());
+            SpiderDebug.log("jar-loader", "retained translated loaders count=%s total=%s",
+                    loaders.size(), RETAINED_ON_TRANSLATED_RUNTIME.size());
+        }
     }
 
     public void setRecent(String recent) {
@@ -57,9 +87,13 @@ public class JarLoader {
         SpiderDebug.log("jar-loader", "recent=%s", recent);
     }
 
+    public java.util.Set<String> activeKeys() {
+        return java.util.Set.copyOf(loaders.keySet());
+    }
+
     private void load(String key, File file) {
         long start = System.currentTimeMillis();
-        if (Thread.interrupted()) {
+        if (Thread.currentThread().isInterrupted()) {
             SpiderDebug.log("jar-loader", "load skip interrupted key=%s", key);
             return;
         }
@@ -95,10 +129,10 @@ public class JarLoader {
                 long start = System.currentTimeMillis();
                 try {
                     Response response = chain.proceed(request);
-                    if (iframe) SpiderDebug.log("jar-loader", "response code=%s final=%s type=%s encoding=%s length=%s cost=%sms", response.code(), response.request().url(), response.header("Content-Type"), response.header("Content-Encoding"), response.header("Content-Length"), System.currentTimeMillis() - start);
+                    if (iframe) SpiderDebug.log("youtube-iframe", "response code=%s final=%s type=%s encoding=%s length=%s cost=%sms", response.code(), response.request().url(), response.header("Content-Type"), response.header("Content-Encoding"), response.header("Content-Length"), System.currentTimeMillis() - start);
                     return response;
                 } catch (Throwable e) {
-                    if (iframe) SpiderDebug.log("jar-loader", "failed url=%s cost=%sms error=%s", request.url(), System.currentTimeMillis() - start, error(e));
+                    if (iframe) SpiderDebug.log("youtube-iframe", "failed url=%s cost=%sms error=%s", request.url(), System.currentTimeMillis() - start, error(e));
                     throw e;
                 }
             }).build();
@@ -115,9 +149,10 @@ public class JarLoader {
                 Throwable cause = e;
                 while (cause.getCause() != null) cause = cause.getCause();
                 SpiderDebug.log("youtube-iframe", "probe failed error=%s", cause.getClass().getName() + ":" + cause.getMessage());
-                SpiderDebug.log("jar-loader", cause);
+                SpiderDebug.log("youtube-iframe", cause);
             }
         } catch (ClassNotFoundException | NoSuchMethodException ignored) {
+            // Optional compatibility hook used only by jars which expose it.
         } catch (Throwable e) {
             SpiderDebug.log("jar-loader", "network client inject failed key=%s error=%s", key, error(e));
         }
@@ -170,6 +205,8 @@ public class JarLoader {
                 } else if (jar.startsWith("file")) {
                     load(key, Path.local(jar));
                 } else {
+                    // 配置里 jar 写的是原始 clan:// 或绝对路径（loadXbpqSites 会原样透传 globalSpider），
+                    // 与 fish 一致：兜底按本地文件解析，否则 PQ 类文件源静默加载不出来。
                     File local = UrlUtil.toLocalFile(jar);
                     if (local != null && local.exists()) load(key, local);
                 }
@@ -191,11 +228,23 @@ public class JarLoader {
     }
 
     public Spider getSpider(String key, String api, String ext, String jar) {
+        return getSpider("", key, api, ext, jar);
+    }
+
+    /**
+     * 按 (命名空间, jar, siteKey) 取 spider：桥接解析非激活配置时不能写进激活配置的槽位。
+     * 空命名空间等于原来的行为（jar md5 + siteKey），loaders 仍只按 jar md5 建键。
+     */
+    public Spider getSpider(String namespace, String key, String api, String ext, String jar) {
         String jaKey = Util.md5(jar);
-        String spKey = jaKey + key;
-        return spiders.computeIfAbsent(spKey, k -> {
+        String spKey = jaKey + BaseLoader.slot(namespace, key);
+        return getOrCreateSpider(spKey, () -> {
             long start = System.currentTimeMillis();
             try {
+                if (Thread.currentThread().isInterrupted()) {
+                    SpiderDebug.log("jar-loader", "spider init skip interrupted site=%s api=%s jar=%s", key, api, jaKey);
+                    return new SpiderNull();
+                }
                 SpiderDebug.log("jar-loader", "spider init start site=%s api=%s jar=%s ext=%s", key, api, jaKey, ext == null ? 0 : ext.length());
                 parseJar(jaKey, jar);
                 DexClassLoader loader = loaders.get(jaKey);
@@ -209,12 +258,48 @@ public class JarLoader {
                 SpiderDebug.log("jar-loader", "spider init done site=%s api=%s jar=%s class=%s cost=%sms", key, api, jaKey, spider.getClass().getName(), System.currentTimeMillis() - start);
                 return spider;
             } catch (Throwable e) {
+                if (isInterrupted(e)) Thread.currentThread().interrupt();
                 SpiderDebug.log("jar-loader", "spider init error site=%s api=%s jar=%s cost=%sms error=%s", key, api, jaKey, System.currentTimeMillis() - start, error(e));
                 SpiderDebug.log("jar-loader", e);
                 e.printStackTrace();
                 return new SpiderNull();
             }
         });
+    }
+
+    Spider getOrCreateSpider(String key, Supplier<Spider> factory) {
+        // A canceled request must stop immediately; a transient initialization failure
+        // gets one retry and SpiderNull is never cached across requests.
+        if (Thread.currentThread().isInterrupted()) return new SpiderNull();
+        Spider cached = spiders.get(key);
+        if (cached != null) return cached;
+        Object lock = locks.computeIfAbsent("spider:" + key, ignored -> new Object());
+        synchronized (lock) {
+            if (Thread.currentThread().isInterrupted()) return new SpiderNull();
+            cached = spiders.get(key);
+            if (cached != null) return cached;
+            Spider created = null;
+            for (int attempt = 1; attempt <= SPIDER_INIT_ATTEMPTS; attempt++) {
+                if (Thread.currentThread().isInterrupted()) break;
+                created = factory.get();
+                if (created != null && !(created instanceof SpiderNull)) {
+                    spiders.put(key, created);
+                    if (!Thread.currentThread().isInterrupted()) return created;
+                    SpiderDebug.log("jar-loader", "spider init completed after cancel key=%s", key);
+                    return new SpiderNull();
+                }
+                if (Thread.currentThread().isInterrupted() || attempt == SPIDER_INIT_ATTEMPTS) break;
+                SpiderDebug.log("jar-loader", "spider init retry key=%s attempt=%s", key, attempt + 1);
+            }
+            return created == null ? new SpiderNull() : created;
+        }
+    }
+
+    private static boolean isInterrupted(Throwable e) {
+        for (Throwable cause = e; cause != null; cause = cause.getCause()) {
+            if (cause instanceof InterruptedException || cause instanceof CancellationException) return true;
+        }
+        return false;
     }
 
     private String source(String jar) {

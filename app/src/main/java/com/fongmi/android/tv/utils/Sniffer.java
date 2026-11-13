@@ -14,7 +14,7 @@ import com.github.catvod.utils.Json;
 import com.github.catvod.utils.Trans;
 import com.github.catvod.utils.Util;
 import com.google.common.net.HttpHeaders;
- 
+
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -39,13 +39,13 @@ public class Sniffer {
     }
 
     /**
-     * 推送串携带请求头的约定，与图片地址（ImgUtil）保持一致：
-     * <code>url@Headers=&lt;encode(json)&gt;</code>，另外兼容 @Cookie= / @Referer= / @User-Agent=。
+     * 推送串携带请求头的约定：<code>url@Headers=&lt;encode(json)&gt;</code>，
+     * 另外兼容 @Cookie= / @Referer= / @User-Agent=。
      * json 用 Uri.encode 编码，避免空格、#、$、& 等字符干扰后续的正则/线路/快捷键解析。
      */
     public static final String HEADERS_TAG = "@Headers=";
     private static final String[] HEADER_TAGS = {"@Headers=", "@Cookie=", "@Referer=", "@User-Agent="};
- 
+
     /** 取推送串里的真实地址；不含请求头段时原样返回。 */
     public static String pushUrl(String text) {
         if (TextUtils.isEmpty(text)) return "";
@@ -55,7 +55,13 @@ public class Sniffer {
         }
         return text;
     }
- 
+
+    /** 生成携带请求头的推送串。 */
+    public static String pushPayload(String url, Map<String, String> headers) {
+        if (TextUtils.isEmpty(url) || headers == null || headers.isEmpty()) return url;
+        return url + HEADERS_TAG + Uri.encode(App.gson().toJson(headers));
+    }
+
     /** 取推送串里的请求头（含 @Headers=<json> 与单独的头段）。 */
     public static Map<String, String> pushHeaders(String text) {
         Map<String, String> headers = new LinkedHashMap<>();
@@ -72,13 +78,7 @@ public class Sniffer {
         addPushHeader(headers, text, "@User-Agent=", HttpHeaders.USER_AGENT);
         return headers;
     }
- 
-    /** 生成携带请求头的推送串。 */
-    public static String pushPayload(String url, Map<String, String> headers) {
-        if (TextUtils.isEmpty(url) || headers == null || headers.isEmpty()) return url;
-        return url + HEADERS_TAG + Uri.encode(App.gson().toJson(headers));
-    }
- 
+
     private static String segment(String text, String tag) {
         int idx = text.indexOf(tag);
         if (idx < 0) return "";
@@ -86,27 +86,10 @@ public class Sniffer {
         int end = raw.indexOf('@');
         return end < 0 ? raw : raw.substring(0, end);
     }
- 
+
     private static void addPushHeader(Map<String, String> headers, String text, String tag, String name) {
         String raw = segment(text, tag);
         if (!TextUtils.isEmpty(raw)) headers.put(UrlUtil.fixHeader(name), Uri.decode(raw));
-    }
- 
-    public static boolean isVideoFormat(String url) {
-        // 资源网关地址形如 http://127.0.0.1:9978/webResource?url=<encoded>&headers=...
-        // 真实地址藏在被编码的 url 参数里，直接匹配正则必然失败，
-        // 会导致播放页把默认线路排成"嗅探"。
-        String inner = gatewayTarget(url);
-        if (!TextUtils.isEmpty(inner)) url = inner;
-        // 推送串带 @Headers= 时同样要剥掉，否则 .m3u8@Headers= 匹配不上
-        url = pushUrl(url);
-        Rule rule = getRule(UrlUtil.uri(url));
-        for (String exclude : rule.getExclude()) if (url.contains(exclude)) return false;
-        for (String exclude : rule.getExclude()) if (Pattern.compile(exclude).matcher(url).find()) return false;
-        for (String regex : rule.getRegex()) if (url.contains(regex)) return true;
-        for (String regex : rule.getRegex()) if (Pattern.compile(regex).matcher(url).find()) return true;
-        if (url.contains("url=http") || url.contains("v=http") || url.contains(".html")) return false;
-        return SNIFFER.matcher(url).find();
     }
 
     /** 取资源网关地址里被编码的真实地址；非网关地址返回空。 */
@@ -130,6 +113,21 @@ public class Sniffer {
         } catch (Throwable ignored) {
         }
         return "";
+    }
+
+    public static boolean isVideoFormat(String url) {
+        // 资源网关地址形如 /webResource?url=<encoded>&headers=...，真实地址藏在被编码的 url 参数里
+        String inner = gatewayTarget(url);
+        if (!TextUtils.isEmpty(inner)) url = inner;
+        // 推送串带 @Headers= 时同样要剥掉，否则 .m3u8@Headers= 匹配不上
+        url = pushUrl(url);
+        Rule rule = getRule(UrlUtil.uri(url));
+        for (String exclude : rule.getExclude()) if (url.contains(exclude)) return false;
+        for (String exclude : rule.getExclude()) if (Pattern.compile(exclude).matcher(url).find()) return false;
+        for (String regex : rule.getRegex()) if (url.contains(regex)) return true;
+        for (String regex : rule.getRegex()) if (Pattern.compile(regex).matcher(url).find()) return true;
+        if (url.contains("url=http") || url.contains("v=http") || url.contains(".html")) return false;
+        return SNIFFER.matcher(url).find();
     }
 
     public static List<String> getScript(Uri uri) {

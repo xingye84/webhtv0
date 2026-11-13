@@ -26,44 +26,50 @@ import com.fongmi.android.tv.bean.Config;
 import com.fongmi.android.tv.bean.History;
 import com.fongmi.android.tv.bean.Site;
 import com.fongmi.android.tv.databinding.ActivityHomeBinding;
-import com.fongmi.android.tv.db.AppDatabase;
 import com.fongmi.android.tv.event.ConfigEvent;
 import com.fongmi.android.tv.event.RefreshEvent;
 import com.fongmi.android.tv.event.ServerEvent;
 import com.fongmi.android.tv.event.StateEvent;
+import com.fongmi.android.tv.following.FollowingPlaybackBridge;
+import com.fongmi.android.tv.following.FollowingSettings;
+import com.fongmi.android.tv.following.FollowingScheduler;
 import com.fongmi.android.tv.impl.Callback;
+import com.fongmi.android.tv.lab.LabActivity;
+import com.fongmi.android.tv.lab.LabConfig;
 import com.fongmi.android.tv.player.Source;
 import com.fongmi.android.tv.receiver.ShortcutReceiver;
 import com.fongmi.android.tv.server.Server;
-import com.fongmi.android.tv.service.PlaybackService;
 import com.fongmi.android.tv.setting.Setting;
-import com.fongmi.android.tv.utils.Task;
 import com.fongmi.android.tv.ui.base.BaseActivity;
 import com.fongmi.android.tv.ui.custom.FragmentStateManager;
 import com.fongmi.android.tv.ui.fragment.SettingEnhanceFragment;
+import com.fongmi.android.tv.ui.fragment.SettingAdFragment;
+import com.fongmi.android.tv.ui.fragment.SettingAiFragment;
+import com.fongmi.android.tv.ui.fragment.SettingTmdbFragment;
 import com.fongmi.android.tv.ui.fragment.SettingDanmakuFragment;
 import com.fongmi.android.tv.ui.fragment.SettingFragment;
+import com.fongmi.android.tv.ui.fragment.SettingPersonalFragment;
 import com.fongmi.android.tv.ui.fragment.SettingPlayerFragment;
+import com.fongmi.android.tv.ui.fragment.SettingSubtitleFragment;
 import com.fongmi.android.tv.ui.fragment.VodFragment;
 import com.fongmi.android.tv.utils.FileChooser;
 import com.fongmi.android.tv.utils.MobileWindow;
 import com.fongmi.android.tv.utils.Notify;
 import com.fongmi.android.tv.utils.PermissionUtil;
+import com.fongmi.android.tv.utils.Task;
 import com.fongmi.android.tv.utils.UrlUtil;
 import com.fongmi.android.tv.utils.Util;
 import com.fongmi.android.tv.web.WebHomeChromeStartup;
 import com.fongmi.android.tv.web.WebHomeViewport;
 import com.github.catvod.net.OkHttp;
-import com.github.catvod.utils.Path;
 import com.google.android.material.navigation.NavigationBarView;
 import com.google.gson.JsonObject;
 
+import java.util.List;
 import org.greenrobot.eventbus.Subscribe;
 import org.greenrobot.eventbus.ThreadMode;
 
-import java.util.List;
-
-public class HomeActivity extends BaseActivity implements NavigationBarView.OnItemSelectedListener, WebHomeChromeController.Host {
+public class HomeActivity extends BaseActivity implements NavigationBarView.OnItemSelectedListener, WebHomeChromeController.Host, VodFragment.ConfigRetry {
 
     public static final String EXTRA_NAV_POSITION = "nav_position";
     private static final String STATE_RETURN_VOD_FROM_ENHANCE = "returnVodFromEnhance";
@@ -73,10 +79,10 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
     private ActivityHomeBinding mBinding;
     private WebHomeChromeController mChrome;
     private Config mStartupConfig;
+    private boolean mStartupActionDone;
     private boolean wideWindow;
     private int currentPosition;
     private boolean returnVodFromEnhance;
-    private boolean mStartupActionDone;
 
     @Override
     protected ViewBinding getBinding() {
@@ -87,10 +93,6 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
-        if (intent.hasExtra(EXTRA_NAV_POSITION)) {
-            change(intent.getIntExtra(EXTRA_NAV_POSITION, 0));
-            intent.removeExtra(EXTRA_NAV_POSITION);
-        }
         checkAction(intent);
     }
 
@@ -109,12 +111,21 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
         mChrome = new WebHomeChromeController(this, mBinding, this, savedInstanceState, WebHomeChromeStartup.restore(mStartupConfig));
         mBinding.getRoot().addOnLayoutChangeListener((view, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) -> checkWindowShape(right - left, bottom - top));
         mBinding.navigation.setOnItemSelectedListener(this);
-        PermissionUtil.requestFile(this, allGranted -> {
-            PermissionUtil.requestNotify(this);
-            if (allGranted) initConfig();
-        });
+        setNavigation();
+        PermissionUtil.requestFile(this, allGranted -> PermissionUtil.requestNotify(this));
+        FollowingScheduler.ensurePeriodic(this);
+        FollowingScheduler.enqueueDueNow(this);
         initFragment(savedInstanceState);
+        if (savedInstanceState == null && getIntent().hasExtra(EXTRA_NAV_POSITION)) checkAction(getIntent());
         initConfig();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (mBinding.navigation.getMenu().findItem(R.id.lab).isVisible() != LabConfig.get().getNavEntry()
+                || mBinding.navigation.getMenu().findItem(R.id.following).isVisible() != FollowingSettings.isEnabled()) setNavigation();
+        updateFollowingBadge();
     }
 
     @Override
@@ -159,6 +170,11 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
             case 2 -> SettingPlayerFragment.newInstance();
             case 3 -> SettingEnhanceFragment.newInstance();
             case 4 -> SettingDanmakuFragment.newInstance();
+            case 5 -> SettingPersonalFragment.newInstance();
+            case 6 -> SettingSubtitleFragment.newInstance();
+            case 7 -> SettingTmdbFragment.newInstance();
+            case 8 -> SettingAiFragment.newInstance();
+            case 9 -> SettingAdFragment.newInstance();
             default -> null;
         });
         if (savedInstanceState == null) change(0);
@@ -171,10 +187,23 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
         changeFragment(position <= 0 ? 0 : position);
     }
 
-    public void initConfig() {
-        VodConfig.get().init().load(getCallback());
+    private void initConfig() {
+        VodConfig.get().config(mStartupConfig == null ? Config.vod() : mStartupConfig).load(getCallback());
         LiveConfig.get().init().load();
         WallConfig.get().init();
+    }
+
+    /**
+     * 首页错误态的重试动作。
+     *
+     * <p>失败的那一步是这里的**内容源配置加载**（{@link #initConfig()}），所以重试必须回到它——
+     * 由 VodFragment 通过 {@link VodFragment.ConfigRetry} 回调过来。重试期间先把状态浮层切回
+     * 加载态，避免错误态一直停在屏幕上。
+     */
+    @Override
+    public void retryConfig() {
+        StateEvent.progress();
+        initConfig();
     }
 
     private Callback getCallback() {
@@ -185,12 +214,30 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
                 runStartupAction();
             }
 
+            /**
+             * 还没有配置任何内容源（重置应用、重装或恢复出厂后的首次启动）。
+             *
+             * <p>这不是失败：没有地址可请求、没有失败原因、重试也永远不会成功。改动前
+             * {@code BaseConfig} 把它当 {@code error("")} 抛出来，首页便显示「内容源加载失败 /
+             * 重试」——一个不存在的故障加一个点了没用的按钮。这里改发「未配置」状态：
+             * 不接管首页，由 {@code VodFragment} 收起状态浮层、保留底部导航；添加接口仍走
+             * 既有的「设置 → 点播」管理面板（{@code HistoryDialog} 的「添加」）。
+             */
+            @Override
+            public void noConfig() {
+                resetVodChrome();
+                checkAction(getIntent());
+                StateEvent.noConfig();
+            }
+
             @Override
             public void error(String msg) {
                 resetVodChrome();
                 checkAction(getIntent());
                 runStartupAction();
-                StateEvent.empty();
+                // 失败要发 ERROR（带原因），不能发 EMPTY：消费方对 EMPTY 的处理只是
+                // "隐藏转圈"，于是加载失败后首页是一片空白，用户只看到一个会消失的吐司。
+                StateEvent.error(msg);
                 Notify.show(msg);
             }
         };
@@ -232,7 +279,10 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
     private void setNavigation() {
         mBinding.navigation.getMenu().findItem(R.id.vod).setVisible(true);
         mBinding.navigation.getMenu().findItem(R.id.setting).setVisible(true);
-        mBinding.navigation.getMenu().findItem(R.id.live).setVisible(LiveConfig.hasLoadedLives());
+        mBinding.navigation.getMenu().findItem(R.id.lab).setVisible(LabConfig.get().getNavEntry());
+        mBinding.navigation.getMenu().findItem(R.id.live).setVisible(LiveConfig.hasUrl());
+        mBinding.navigation.getMenu().findItem(R.id.following).setVisible(FollowingSettings.isEnabled());
+        updateFollowingBadge();
         syncNavigationSelection();
     }
 
@@ -283,14 +333,10 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
         }
     }
 
-    @Subscribe(threadMode = ThreadMode.MAIN)
-    public void onRefreshEvent(RefreshEvent event) {
-        if (event.getType() == RefreshEvent.Type.THEME) recreate();
-    }
 
     @Subscribe(threadMode = ThreadMode.MAIN)
     public void onServerEvent(ServerEvent event) {
-        if (event.type() == ServerEvent.Type.PUSH) VideoActivity.push(this, event.text(), event.name());
+        if (event.type() == ServerEvent.Type.PUSH) VideoActivity.push(this, event.text());
         if (event.type() == ServerEvent.Type.SEARCH) SearchActivity.start(this, event.text());
     }
 
@@ -299,9 +345,39 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
         returnVodFromEnhance = false;
         setNavigationVisible(true);
         if (item.getItemId() == R.id.setting) return changeFragment(1);
+        if (item.getItemId() == R.id.lab) {
+            LabActivity.start(this);
+            return false;
+        }
         if (item.getItemId() == R.id.vod) return changeFragment(0);
         if (item.getItemId() == R.id.live) return openLive();
+        if (item.getItemId() == R.id.following) {
+            FollowingActivity.start(this, null);
+            return false;
+        }
         return false;
+    }
+
+    private void updateFollowingBadge() {
+        if (mBinding == null || mBinding.navigation.getMenu().findItem(R.id.following) == null) return;
+        if (!FollowingSettings.isEnabled()) {
+            mBinding.navigation.removeBadge(R.id.following);
+            return;
+        }
+        applyFollowingBadge(FollowingPlaybackBridge.cachedUnreadCount());
+        FollowingPlaybackBridge.refreshUnreadCountAsync(unread -> {
+            if (!isFinishing() && !isDestroyed()) applyFollowingBadge(unread);
+        });
+    }
+
+    private void applyFollowingBadge(int unread) {
+        if (mBinding == null || mBinding.navigation.getMenu().findItem(R.id.following) == null) return;
+        if (!FollowingSettings.isEnabled()) {
+            mBinding.navigation.removeBadge(R.id.following);
+            return;
+        }
+        if (unread > 0) mBinding.navigation.getOrCreateBadge(R.id.following).setNumber(unread);
+        else mBinding.navigation.removeBadge(R.id.following);
     }
 
     private void selectNavigation(int position) {
@@ -323,6 +399,10 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
         if (changed) currentPosition = position;
         refreshWebHomeChromeLayout();
         return changed;
+    }
+
+    private boolean isSettingSubPageVisible() {
+        return mManager.isVisible(2) || mManager.isVisible(3) || mManager.isVisible(4) || mManager.isVisible(5) || mManager.isVisible(6) || mManager.isVisible(7) || mManager.isVisible(8) || mManager.isVisible(9);
     }
 
     private void refreshWebHomeChromeLayout() {
@@ -460,15 +540,15 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
         } else if (returnVodFromEnhance && mManager.isVisible(3)) {
             returnVodFromEnhance = false;
             change(0);
-        } else if (mManager.isVisible(2) || mManager.isVisible(3) || mManager.isVisible(4)) {
+        } else if (isSettingSubPageVisible()) {
             change(1);
         } else if (mManager.isVisible(1)) {
             change(0);
         } else if (mManager.canBack(0)) {
-            // 根页面返回 = 真正退出：后台线程同步备份后结束进程，避免进程残留（外挂 jar 悬浮窗、播放服务等仍存活）。想进后台请用 Home 键。
+            // 根页面返回 = 真正退出（与 fish 一致）：先销毁界面给出即时反馈，然后结束进程。
+            // 退出不再清理缓存、不再备份：两者都改为冷启动后空闲时段各跑一次（进程常被直接杀掉）。
+            finish();
             Task.execute(() -> {
-                AppDatabase.backupOnExitSync();
-                if (Setting.isAutoClearCache()) Path.clear(Path.cache());
                 Process.killProcess(Process.myPid());
                 System.exit(0);
             });
@@ -479,7 +559,7 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
     protected void onDestroy() {
         if (mChrome != null) mChrome.destroy();
         LiveConfig.get().clear();
-        VodConfig.get().clear();
+        VodConfig.get().clear("mobile-home-destroy");
         OkHttp.get().clear();
         Source.get().exit();
         Server.get().stop();

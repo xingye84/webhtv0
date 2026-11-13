@@ -6,10 +6,13 @@ import android.graphics.drawable.ColorDrawable;
 import android.view.Gravity;
 import android.view.Window;
 import android.view.WindowManager;
+import android.view.View;
 
 import androidx.annotation.NonNull;
 import androidx.fragment.app.Fragment;
 import androidx.fragment.app.FragmentActivity;
+import androidx.recyclerview.widget.ItemTouchHelper;
+import androidx.recyclerview.widget.RecyclerView;
 import androidx.viewbinding.ViewBinding;
 
 import com.fongmi.android.tv.R;
@@ -19,8 +22,10 @@ import com.fongmi.android.tv.api.config.WallConfig;
 import com.fongmi.android.tv.bean.Config;
 import com.fongmi.android.tv.databinding.DialogHistoryBinding;
 import com.fongmi.android.tv.impl.ConfigListener;
+import com.fongmi.android.tv.theme.WebHtvAlertDialogBuilder;
 import com.fongmi.android.tv.ui.adapter.ConfigAdapter;
 import com.fongmi.android.tv.ui.custom.SpaceItemDecoration;
+import com.fongmi.android.tv.utils.Notify;
 import com.fongmi.android.tv.utils.ResUtil;
 import com.google.android.material.dialog.MaterialAlertDialogBuilder;
 
@@ -29,9 +34,11 @@ public class HistoryDialog extends BaseAlertDialog implements ConfigAdapter.OnCl
     private DialogHistoryBinding binding;
     private ConfigListener listener;
     private ConfigAdapter adapter;
+    private ItemTouchHelper sortTouchHelper;
 
     private int type;
     private boolean readOnly;
+    private boolean manage;
 
     public static HistoryDialog create() {
         return new HistoryDialog();
@@ -54,6 +61,11 @@ public class HistoryDialog extends BaseAlertDialog implements ConfigAdapter.OnCl
 
     public HistoryDialog readOnly() {
         readOnly = true;
+        return this;
+    }
+
+    public HistoryDialog manage() {
+        manage = true;
         return this;
     }
 
@@ -82,7 +94,7 @@ public class HistoryDialog extends BaseAlertDialog implements ConfigAdapter.OnCl
 
     @Override
     protected MaterialAlertDialogBuilder getBuilder() {
-        return new MaterialAlertDialogBuilder(requireActivity(), R.style.ThemeOverlay_WebHTV_LightDialog).setView(getBinding().getRoot());
+        return new WebHtvAlertDialogBuilder(requireActivity(), R.style.ThemeOverlay_WebHTV_Dialog).setView(getBinding().getRoot());
     }
 
     @Override
@@ -92,7 +104,31 @@ public class HistoryDialog extends BaseAlertDialog implements ConfigAdapter.OnCl
         binding.recycler.setHasFixedSize(false);
         if (isFull()) binding.recycler.setMaxHeight(ResUtil.dp2px(264));
         binding.recycler.addItemDecoration(new SpaceItemDecoration(1, 8));
-        binding.recycler.setAdapter(adapter.readOnly(readOnly).addAll(type, getConfig()));
+        binding.recycler.setAdapter(adapter.readOnly(readOnly).protectCurrent(manage).addAll(type, getConfig()));
+        binding.add.setVisibility(manage ? View.VISIBLE : View.GONE);
+        binding.add.setOnClickListener(v -> onAdd());
+        if (type == 0 && !readOnly) attachSortHelper();
+    }
+
+    private void onAdd() {
+        ConfigDialog dialog = ConfigDialog.create();
+        if (type == 0) dialog.vod();
+        else if (type == 1) dialog.live();
+        else dialog.wall();
+        if (getParentFragment() != null) dialog.show(getParentFragment());
+        else dialog.show(requireActivity());
+        dismiss();
+    }
+
+    private void attachSortHelper() {
+        sortTouchHelper = new ItemTouchHelper(new ItemTouchHelper.SimpleCallback(ItemTouchHelper.UP | ItemTouchHelper.DOWN, 0) {
+            @Override public boolean isLongPressDragEnabled() { return false; }
+            @Override public boolean onMove(@NonNull RecyclerView view, @NonNull RecyclerView.ViewHolder from, @NonNull RecyclerView.ViewHolder to) {
+                return adapter.drag(from.getBindingAdapterPosition(), to.getBindingAdapterPosition());
+            }
+            @Override public void onSwiped(@NonNull RecyclerView.ViewHolder holder, int direction) { }
+        });
+        sortTouchHelper.attachToRecyclerView(binding.recycler);
     }
 
     private Config getConfig() {
@@ -111,14 +147,43 @@ public class HistoryDialog extends BaseAlertDialog implements ConfigAdapter.OnCl
     }
 
     @Override
+    public boolean onTextLongClick(ConfigAdapter.ViewHolder holder) {
+        if (type != 0 || readOnly || sortTouchHelper == null) return false;
+        sortTouchHelper.startDrag(holder);
+        return true;
+    }
+
+    @Override
+    public void onEditClick(Config item) {
+        ConfigDialog dialog = ConfigDialog.create().target(item).edit();
+        if (type == 0) dialog.vod();
+        else if (type == 1) dialog.live();
+        else dialog.wall();
+        if (getParentFragment() != null) dialog.show(getParentFragment());
+        else dialog.show(requireActivity().getSupportFragmentManager(), null);
+        dismiss();
+    }
+
+    @Override
     public void onDeleteClick(Config item) {
-        if (adapter.remove(item) == 0) dismiss();
+        if (adapter.isProtectedCurrent(item)) {
+            Notify.show(R.string.config_current_delete_message);
+            return;
+        }
+        new WebHtvAlertDialogBuilder(requireContext())
+                .setTitle(R.string.config_delete_title)
+                .setMessage(getString(R.string.config_delete_message, item.getDesc()))
+                .setNegativeButton(R.string.dialog_negative, null)
+                .setPositiveButton(R.string.dialog_positive, (dialog, which) -> {
+                    if (adapter.remove(item) == 0) dismiss();
+                })
+                .show();
     }
 
     @Override
     public void onStart() {
         super.onStart();
-        if (adapter.getItemCount() == 0) dismiss();
+        if (adapter.getItemCount() == 0 && !manage) dismiss();
         else configureWindow();
     }
 

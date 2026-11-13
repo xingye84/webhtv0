@@ -36,6 +36,7 @@ import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
 import androidx.appcompat.widget.LinearLayoutCompat;
 import androidx.core.content.ContextCompat;
+import androidx.core.view.ViewCompat;
 import androidx.core.widget.NestedScrollView;
 import androidx.fragment.app.Fragment;
 import androidx.fragment.app.FragmentActivity;
@@ -62,6 +63,7 @@ import com.fongmi.android.tv.gitcloud.drive.JGitDriveEngine;
 import com.fongmi.android.tv.gitcloud.provider.GitCloudProvider;
 import com.fongmi.android.tv.gitcloud.provider.GitCloudProviders;
 import com.fongmi.android.tv.gitcloud.secure.GitCloudTokenStore;
+import com.fongmi.android.tv.theme.WebHtvAlertDialogBuilder;
 import com.fongmi.android.tv.ui.custom.SafeScrollEditText;
 import com.fongmi.android.tv.ui.custom.SettingClipboardOverlay;
 import com.fongmi.android.tv.utils.AppBackup;
@@ -168,7 +170,7 @@ public class GitCloudDialog extends BaseAlertDialog {
 
     @Override
     protected MaterialAlertDialogBuilder getBuilder() {
-        return new MaterialAlertDialogBuilder(requireActivity(), R.style.ThemeOverlay_WebHTV_LightDialog).setView(getBinding().getRoot());
+        return new WebHtvAlertDialogBuilder(requireActivity(), R.style.ThemeOverlay_WebHTV_Dialog).setView(getBinding().getRoot());
     }
 
     @Override
@@ -178,8 +180,8 @@ public class GitCloudDialog extends BaseAlertDialog {
         if (window == null) return;
         WindowManager.LayoutParams params = window.getAttributes();
         boolean land = ResUtil.isLand(requireContext());
-        params.width = (int) (ResUtil.getScreenWidth(requireContext()) * (land ? 0.72f : 0.94f));
-        params.height = (int) (ResUtil.getScreenHeight(requireContext()) * 0.86f);
+        params.width = (int) (DialogSafeArea.width(requireActivity(), window) * (land ? 0.72f : 0.94f));
+        params.height = (int) (DialogSafeArea.height(requireActivity(), window) * 0.86f);
         params.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
         params.y = dp(18);
         window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
@@ -1771,8 +1773,9 @@ public class GitCloudDialog extends BaseAlertDialog {
         if (!requireAccount("备份需要先添加账号")) return;
         if (repo == null || !repo.privateRepo) return;
         run("生成备份中", () -> {
-            File archive = AppBackup.createTemp((stage, percent, bytes, total) -> updateProgress(progressText(stage, bytes, total), percent, percent <= 0));
-            String name = AppBackup.fileName();
+            AppBackup.CreatedBackup created = AppBackup.createTempResult((stage, percent, bytes, total) -> updateProgress(progressText(stage, bytes, total), percent, percent <= 0));
+            File archive = created.getFile();
+            String name = AppBackup.fileName(created.hasWarning());
             String zip = GitCloudPaths.backupDir() + "/" + name;
             CommitResult result;
             try {
@@ -1798,8 +1801,11 @@ public class GitCloudDialog extends BaseAlertDialog {
             List<GitFile> appFiles = provider().listFiles(account, token(), repo, repo.defaultBranch, "apps");
             List<GitFile> webhtvFiles = provider().listFiles(account, token(), repo, repo.defaultBranch, "apps/webhtv");
             List<GitFile> backupFiles = visibleFiles(GitCloudPaths.backupDir(), provider().listFiles(account, token(), repo, repo.defaultBranch, GitCloudPaths.backupDir()));
+            String message = result.pushed
+                    ? (created.hasWarning() ? "不完整备份已上传：" + created.getResult().warning : "备份已上传")
+                    : result.message;
             App.post(() -> {
-                Notify.show(result.pushed ? "备份已上传" : result.message);
+                Notify.show(message);
                 if (!isAdded() || binding == null) return;
                 fileTree.clear();
                 fileTree.put("", rootFiles);
@@ -1856,7 +1862,7 @@ public class GitCloudDialog extends BaseAlertDialog {
         GitFile latest = null;
         for (GitFile file : files) {
             if (!isBackupZip(file)) continue;
-            if (latest == null || AppBackup.backupSortKey(file.name).compareToIgnoreCase(AppBackup.backupSortKey(latest.name)) > 0) latest = file;
+            if (latest == null || AppBackup.compareBackupNames(file.name, latest.name) > 0) latest = file;
         }
         return latest;
     }
@@ -2155,7 +2161,7 @@ public class GitCloudDialog extends BaseAlertDialog {
         edit.setTextColor(Color.parseColor("#202124"));
         edit.setHintTextColor(Color.parseColor("#5F6368"));
         edit.setSelectAllOnFocus(false);
-        edit.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
+        ViewCompat.setImportantForAutofill(edit, View.IMPORTANT_FOR_AUTOFILL_NO);
         if (password) edit.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         layout.addView(edit, new LinearLayoutCompat.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         return new TextInput(layout, edit);

@@ -20,7 +20,6 @@ import java.lang.ref.WeakReference;
 import java.net.URLEncoder;
 import java.security.InvalidParameterException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
@@ -482,7 +481,7 @@ public final class IjkMediaPlayer extends AbstractMediaPlayer {
         }
         native_init();
         setDot(0);
-        native_setLogLevel(8);
+        native_setLogLevel(IJK_LOG_SILENT);
         mIsNativeInitialized = true;
     }
 
@@ -881,23 +880,24 @@ public final class IjkMediaPlayer extends AbstractMediaPlayer {
     }
 
     public void setDataSource(String str, Map<String, String> map) {
-        for (String str2 : Arrays.asList("User-Agent", "User-Agent".toLowerCase())) {
-            if (map.containsKey(str2)) {
-                setOption(1, "user_agent", map.get(str2));
-                map.remove(str2);
-            }
+        if (map == null || map.isEmpty()) {
+            setDataSource(str);
+            return;
         }
-        StringBuilder sb = new StringBuilder();
+        StringBuilder builder = new StringBuilder();
         for (Map.Entry<String, String> entry : map.entrySet()) {
+            String key = entry.getKey();
             String value = entry.getValue();
-            sb.append(entry.getKey());
-            sb.append(":");
-            if (!TextUtils.isEmpty(value)) {
-                sb.append(value);
+            if (TextUtils.isEmpty(key)) continue;
+            if ("User-Agent".equalsIgnoreCase(key)) {
+                if (!TextUtils.isEmpty(value)) setOption(OPT_CATEGORY_FORMAT, "user_agent", value);
+                continue;
             }
-            sb.append("\r\n");
-            setOption(1, "headers", sb.toString());
+            builder.append(key).append(":");
+            if (!TextUtils.isEmpty(value)) builder.append(value);
+            builder.append("\r\n");
         }
+        if (builder.length() > 0) setOption(OPT_CATEGORY_FORMAT, "headers", builder.toString());
         setDataSource(str);
     }
 
@@ -914,6 +914,19 @@ public final class IjkMediaPlayer extends AbstractMediaPlayer {
 
     @Override // tv.danmaku.ijk.media.player.IMediaPlayer
     public void setLogEnabled(boolean z6) {
+        applyNativeLogLevel(z6);
+    }
+
+    /**
+     * Applies the caller's log preference to the native runtime. {@link #initNativeOnce()} silences
+     * the runtime unconditionally, which is why native surface and EGL failures were invisible.
+     */
+    private void applyNativeLogLevel(boolean enabled) {
+        try {
+            native_setLogLevel(enabled ? IJK_LOG_DEBUG : IJK_LOG_SILENT);
+        } catch (UnsatisfiedLinkError e) {
+            Log.w(TAG, "IJK log level is unavailable in current native library", e);
+        }
     }
 
     @Override // tv.danmaku.ijk.media.player.IMediaPlayer

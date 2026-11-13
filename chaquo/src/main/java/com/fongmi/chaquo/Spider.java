@@ -3,6 +3,7 @@ package com.fongmi.chaquo;
 import android.content.Context;
 
 import com.chaquo.python.PyObject;
+import com.github.catvod.crawler.SpiderDebug;
 import com.github.catvod.utils.Path;
 import com.github.catvod.utils.UriUtil;
 import com.github.catvod.utils.Util;
@@ -14,6 +15,8 @@ import java.util.List;
 import java.util.Map;
 
 public class Spider extends com.github.catvod.crawler.Spider {
+
+    private static final String TAG = "python-spider";
 
     private final PyObject app;
     private final PyObject obj;
@@ -30,77 +33,120 @@ public class Spider extends com.github.catvod.crawler.Spider {
     @Override
     public void init(Context context, String extend) {
         PyObject dependence = app.callAttr("getDependence", obj);
-        if (dependence != null) for (PyObject item : dependence.asList()) download(item + ".py");
+        if (dependence != null) {
+            for (PyObject item : dependence.asList()) {
+                // A dependency that cannot be fetched must not abort init(): that used
+                // to propagate to PyLoader, which degrades the whole site to an
+                // all-empty SpiderNull, so a single unreachable .py made home,
+                // category and search silently render nothing.  Log and continue; a
+                // spider that really needs the module fails later with a clear
+                // ImportError instead.  Throwable rather than Exception so a JVM-level
+                // Error (OutOfMemoryError, StackOverflowError) raised inside the download
+                // call path cannot abort init() either; a Python exception arrives as
+                // Chaquopy's PyException, which is itself a RuntimeException.
+                try {
+                    download(item + ".py");
+                } catch (Throwable e) {
+                    SpiderDebug.log(TAG, "depend download failed name=%s error=%s", item, e);
+                    // SpiderDebug.log() is gated on DebugLogStore.acceptsTag(), which is
+                    // false whenever 调试日志 is off (the default), so the structured line
+                    // alone would leave a skipped dependency invisible in Logcat.  Keep the
+                    // unconditional channel too, as PyLoader does for a failed init.
+                    e.printStackTrace();
+                } finally {
+                    close(item);
+                }
+            }
+            close(dependence);
+        }
         obj.put("siteKey", siteKey);
         app.callAttr("init", obj, extend);
     }
 
     @Override
     public String homeContent(boolean filter) {
-        return app.callAttr("homeContent", obj, filter).toString();
+        return toStr(app.callAttr("homeContent", obj, filter));
     }
 
     @Override
     public String homeVideoContent() {
-        return app.callAttr("homeVideoContent", obj).toString();
+        return toStr(app.callAttr("homeVideoContent", obj));
     }
 
     @Override
     public String categoryContent(String tid, String pg, boolean filter, HashMap<String, String> extend) {
-        return app.callAttr("categoryContent", obj, tid, pg, filter, gson.toJson(extend)).toString();
+        return toStr(app.callAttr("categoryContent", obj, tid, pg, filter, gson.toJson(extend)));
     }
 
     @Override
     public String detailContent(List<String> ids) {
-        return app.callAttr("detailContent", obj, gson.toJson(ids)).toString();
+        return toStr(app.callAttr("detailContent", obj, gson.toJson(ids)));
     }
 
     @Override
     public String searchContent(String key, boolean quick) {
-        return app.callAttr("searchContent", obj, key, quick).toString();
+        return toStr(app.callAttr("searchContent", obj, key, quick));
     }
 
     @Override
     public String searchContent(String key, boolean quick, String pg) {
-        return app.callAttr("searchContent", obj, key, quick, pg).toString();
+        return toStr(app.callAttr("searchContent", obj, key, quick, pg));
     }
 
     @Override
     public String playerContent(String flag, String id, List<String> vipFlags) {
-        return app.callAttr("playerContent", obj, flag, id, gson.toJson(vipFlags)).toString();
+        return toStr(app.callAttr("playerContent", obj, flag, id, gson.toJson(vipFlags)));
     }
 
     @Override
     public String liveContent(String url) {
-        return app.callAttr("liveContent", obj, url).toString();
+        return toStr(app.callAttr("liveContent", obj, url));
     }
 
     @Override
     public boolean manualVideoCheck() {
-        return app.callAttr("manualVideoCheck", obj).toBoolean();
+        return toBool(app.callAttr("manualVideoCheck", obj));
     }
 
     @Override
     public boolean isVideoFormat(String url) {
-        return app.callAttr("isVideoFormat", obj, url).toBoolean();
+        return toBool(app.callAttr("isVideoFormat", obj, url));
     }
 
     @Override
     public Object[] proxy(Map<String, String> params) throws Exception {
-        List<PyObject> list = app.callAttr("localProxy", obj, gson.toJson(params)).asList();
-        boolean base64 = list.size() > 4 && list.get(4).toInt() == 1;
-        boolean header = list.size() > 3 && list.get(3) != null;
-        Object[] result = new Object[4];
-        result[0] = list.get(0).toInt();
-        result[1] = list.get(1).toString();
-        result[2] = getStream(list.get(2), base64);
-        result[3] = header ? getHeader(list.get(3)) : null;
-        return result;
+        PyObject container = app.callAttr("localProxy", obj, gson.toJson(params));
+        try {
+            List<PyObject> list = container.asList();
+            boolean base64 = list.size() > 4 && list.get(4).toInt() == 1;
+            boolean header = list.size() > 3 && list.get(3) != null;
+            Object[] result = new Object[4];
+            result[0] = list.get(0).toInt();
+            result[1] = list.get(1).toString();
+            result[2] = getStream(list.get(2), base64);
+            result[3] = header ? getHeader(list.get(3)) : null;
+            for (PyObject item : list) close(item);
+            return result;
+        } finally {
+            close(container);
+        }
     }
 
     @Override
     public String action(String action) {
-        return app.callAttr("action", obj, action).toString();
+        return toStr(app.callAttr("action", obj, action));
+    }
+
+    public String subtitleInit(String config) {
+        return toStr(app.callAttr("subtitle_init", obj, config == null ? "" : config));
+    }
+
+    public String subtitleSearch(String request) {
+        return toStr(app.callAttr("subtitle_search", obj, request));
+    }
+
+    public String subtitleResolve(String request) {
+        return toStr(app.callAttr("subtitle_resolve", obj, request));
     }
 
     @Override
@@ -133,5 +179,30 @@ public class Spider extends com.github.catvod.crawler.Spider {
         String path = Path.py(name).getAbsolutePath();
         String url = UriUtil.resolve(api, name);
         app.callAttr("download", path, url);
+    }
+
+    private static String toStr(PyObject o) {
+        if (o == null) return null;
+        try {
+            return o.toString();
+        } finally {
+            close(o);
+        }
+    }
+
+    private static boolean toBool(PyObject o) {
+        try {
+            return o != null && o.toBoolean();
+        } finally {
+            close(o);
+        }
+    }
+
+    private static void close(PyObject o) {
+        if (o == null) return;
+        try {
+            o.close();
+        } catch (Throwable ignored) {
+        }
     }
 }

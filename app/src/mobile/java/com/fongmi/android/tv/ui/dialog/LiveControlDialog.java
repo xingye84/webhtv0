@@ -21,6 +21,7 @@ import com.fongmi.android.tv.R;
 import com.fongmi.android.tv.databinding.ActivityLiveBinding;
 import com.fongmi.android.tv.databinding.DialogLiveControlBinding;
 import com.fongmi.android.tv.setting.LiveSetting;
+import com.fongmi.android.tv.setting.PlayerSetting;
 import com.fongmi.android.tv.utils.ResUtil;
 import com.google.android.material.bottomsheet.BottomSheetBehavior;
 import com.google.android.material.bottomsheet.BottomSheetDialog;
@@ -33,7 +34,7 @@ public class LiveControlDialog extends BaseBottomSheetDialog {
     private final String[] scale;
     private DialogLiveControlBinding binding;
     private ActivityLiveBinding parent;
-    private List<TextView> scales;
+    private List<TextView> displays;
 
     public LiveControlDialog() {
         this.scale = ResUtil.getStringArray(R.array.select_scale);
@@ -71,7 +72,7 @@ public class LiveControlDialog extends BaseBottomSheetDialog {
     @Override
     protected ViewBinding getBinding(@NonNull LayoutInflater inflater, @Nullable ViewGroup container) {
         binding = DialogLiveControlBinding.inflate(inflater, container, false);
-        scales = Arrays.asList(binding.scale0, binding.scale1, binding.scale2, binding.scale3, binding.scale4);
+        displays = Arrays.asList(binding.displayTime, binding.displayTraffic, binding.displaySize, binding.displayTitle, binding.displayParams);
         return binding;
     }
 
@@ -80,13 +81,17 @@ public class LiveControlDialog extends BaseBottomSheetDialog {
         binding.sheetWall.setVisibility(View.GONE);
         binding.player.setText(parent.control.action.player.getText());
         binding.decode.setText(parent.control.action.decode.getText());
+        binding.source.setText(parent.control.action.source.getText());
+        binding.source.setContentDescription(parent.control.action.source.getContentDescription());
         binding.playParams.setSelected(parent.control.action.playParams.isSelected());
         binding.invert.setSelected(parent.control.action.invert.isSelected());
         binding.across.setSelected(parent.control.action.across.isSelected());
         binding.change.setSelected(parent.control.action.change.isSelected());
+        syncConfiguredButtonVisibility();
         setTrackVisible();
         setListStyleSelected();
         setScaleText();
+        setDisplaySettings();
         binding.controlScroll.post(() -> binding.controlScroll.scrollTo(0, 0));
     }
 
@@ -122,7 +127,11 @@ public class LiveControlDialog extends BaseBottomSheetDialog {
         binding.text.setOnClickListener(v -> onTrack(binding.text));
         binding.audio.setOnClickListener(v -> onTrack(binding.audio));
         binding.video.setOnClickListener(v -> onTrack(binding.video));
-        for (TextView view : scales) view.setOnClickListener(this::setScale);
+        binding.scale.setOnClickListener(view -> VideoAspectModeDialog.show(requireActivity(), LiveSetting.getScale(), this::setScale));
+        for (int i = 0; i < displays.size(); i++) {
+            int index = i;
+            displays.get(i).setOnClickListener(v -> toggleDisplaySetting(index));
+        }
     }
 
     private Listener listener() {
@@ -143,16 +152,28 @@ public class LiveControlDialog extends BaseBottomSheetDialog {
     }
 
     private void setScaleText() {
-        for (int i = 0; i < scales.size() && i < scale.length; i++) {
-            scales.get(i).setText(scale[i]);
-            scales.get(i).setSelected(i == LiveSetting.getScale());
-        }
+        binding.scale.setText(scale[LiveSetting.getScale()]);
+        binding.scale.setSelected(false);
     }
 
     private void setListStyleSelected() {
         boolean classic = LiveSetting.isListStyleClassic();
         binding.listTransparent.setSelected(classic);
         binding.listReadable.setSelected(!classic);
+    }
+
+    private void setDisplaySettings() {
+        boolean[] checked = PlayerSetting.getLiveDisplayChecked();
+        for (int i = 0; i < displays.size(); i++) displays.get(i).setSelected(i < checked.length && checked[i]);
+    }
+
+    private void toggleDisplaySetting(int index) {
+        boolean[] checked = PlayerSetting.getLiveDisplayChecked();
+        if (index < 0 || index >= checked.length) return;
+        checked[index] = !checked[index];
+        PlayerSetting.putLiveDisplayChecked(checked);
+        setDisplaySettings();
+        listener().onLiveDisplayChanged();
     }
 
     private void setListStyle(boolean classic) {
@@ -164,14 +185,26 @@ public class LiveControlDialog extends BaseBottomSheetDialog {
         if (binding == null || parent == null) return;
         binding.player.setText(parent.control.action.player.getText());
         binding.decode.setText(parent.control.action.decode.getText());
+        // 换源时宿主 control.action.source 已更新，弹窗保持打开也必须跟着改名与读屏语义。
+        binding.source.setText(parent.control.action.source.getText());
+        binding.source.setContentDescription(parent.control.action.source.getContentDescription());
         binding.playParams.setSelected(parent.control.action.playParams.isSelected());
+        syncConfiguredButtonVisibility();
         setTrackVisible();
     }
 
-    private void setScale(View view) {
-        for (TextView textView : scales) textView.setSelected(false);
-        listener().onLiveScalePanel(Integer.parseInt(view.getTag().toString()));
-        view.setSelected(true);
+    /**
+     * 面板与底部动作栏保持一致：用户在「播放器按钮」里关掉的直播同名按钮，面板内也不再出现。
+     */
+    private void syncConfiguredButtonVisibility() {
+        binding.player.setVisibility(parent.control.action.player.getVisibility());
+        binding.decode.setVisibility(parent.control.action.decode.getVisibility());
+        binding.playParams.setVisibility(parent.control.action.playParams.getVisibility());
+    }
+
+    private void setScale(int mode) {
+        listener().onLiveScalePanel(mode);
+        setScaleText();
     }
 
     private void active(TextView view, TextView target) {
@@ -251,6 +284,8 @@ public class LiveControlDialog extends BaseBottomSheetDialog {
         void onLiveBackgroundPanel();
 
         void onLiveListStylePanel(boolean classic);
+
+        void onLiveDisplayChanged();
 
         void onLiveScalePanel(int scale);
 

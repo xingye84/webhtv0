@@ -54,6 +54,8 @@ public class FlagAdapter extends RecyclerView.Adapter<FlagAdapter.ViewHolder> {
     }
 
     public int indexOf(Flag item) {
+        if (item == null) return -1;
+        for (int i = 0; i < mItems.size(); i++) if (mItems.get(i) == item) return i;
         return mItems.indexOf(item);
     }
 
@@ -68,19 +70,20 @@ public class FlagAdapter extends RecyclerView.Adapter<FlagAdapter.ViewHolder> {
     }
 
     public Flag getActivated() {
-        return mItems.get(getPosition());
+        return mItems.isEmpty() ? new Flag() : mItems.get(getPosition());
     }
 
     public void setSelected(Flag item) {
-        if (mItems.isEmpty()) return;
-        if (indexOf(item) == -1) item.setFlag(mItems.get(0).getFlag());
-        for (Flag flag : mItems) flag.setSelected(item);
+        if (mItems.isEmpty() || item == null) return;
+        int position = indexOf(item);
+        if (position == -1) position = 0;
+        for (int i = 0; i < mItems.size(); i++) mItems.get(i).setSelected(i == position);
     }
 
     public void toggle(Episode item) {
+        // 线路焦点回调可能发生在 RecyclerView 布局期间，此处只同步选集状态，不通知线路列表。
         int flagPosition = getPosition();
         for (int i = 0; i < mItems.size(); i++) mItems.get(i).toggle(flagPosition == i, item);
-        notifyDataSetChanged();
     }
 
     public void reverse() {
@@ -92,6 +95,10 @@ public class FlagAdapter extends RecyclerView.Adapter<FlagAdapter.ViewHolder> {
         if (this.nextFocusDown == nextFocusDown) return;
         this.nextFocusDown = nextFocusDown;
         notifyDataSetChanged();
+    }
+
+    public boolean isEmpty() {
+        return getItemCount() == 0;
     }
 
     public void setOnKeyListener(View.OnKeyListener keyListener) {
@@ -114,6 +121,10 @@ public class FlagAdapter extends RecyclerView.Adapter<FlagAdapter.ViewHolder> {
     public void onBindViewHolder(@NonNull ViewHolder holder, int position) {
         Flag item = mItems.get(position);
         holder.binding.text.setText(item.getShow());
+        // selected 只是跑马灯开关（selector_video_item 的 state_selected 无描边）；
+        // 「当前播放线路」的绿色 2dp tvCurrentRing 描边走 state_activated，
+        // 见 selector_video_item.xml 顶部的统一规范注释。
+        holder.binding.text.setActivated(item.isSelected());
         holder.binding.text.setSelected(item.isSelected());
         holder.binding.text.setNextFocusDownId(nextFocusDown);
         holder.binding.text.setOnKeyListener(keyListener);

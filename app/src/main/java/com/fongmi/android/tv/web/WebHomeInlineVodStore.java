@@ -4,6 +4,7 @@ import android.text.TextUtils;
 
 import com.fongmi.android.tv.App;
 import com.fongmi.android.tv.bean.Result;
+import com.fongmi.android.tv.bean.Site;
 import com.fongmi.android.tv.bean.Vod;
 import com.fongmi.android.tv.player.Source;
 import com.github.catvod.crawler.SpiderDebug;
@@ -14,7 +15,11 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.common.net.HttpHeaders;
 
+import java.net.URI;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -31,16 +36,24 @@ public class WebHomeInlineVodStore {
     private static final long MEDIA_TTL_MS = 6 * 60 * 60 * 1000L;
 
     private static final Map<String, Entry> ITEMS = new ConcurrentHashMap<>();
+    // Inline playback uses a synthetic route key; keep the real site for site-level policies.
+    private static final Map<String, Site> ORIGIN_SITES = new ConcurrentHashMap<>();
+    // WebHome 嗅探 payload 自带的网页详情图；历史卡片在没有 TMDB 海报时用它兜底。
+    private static final Map<String, String> VOD_PICS = new ConcurrentHashMap<>();
     private static final Map<String, HeaderSpec> URL_HEADERS = new ConcurrentHashMap<>();
     private static final Map<String, EpisodeSpec> URL_EPISODES = new ConcurrentHashMap<>();
     // 剧集地址 -> VOD id：player() 只拿得到剧集地址，解析成功后要按 VOD id 落盘
     private static final Map<String, String> URL_VOD = new ConcurrentHashMap<>();
 
     public static String put(JsonObject payload) {
-        return put(payload, null);
+        return put(payload, null, null);
     }
 
     public static String put(JsonObject payload, Resolver resolver) {
+        return put(payload, resolver, null);
+    }
+
+    static String put(JsonObject payload, Resolver resolver, Site originSite) {
         Vod vod = App.gson().fromJson(payload, Vod.class);
         if (vod == null) vod = new Vod();
         String id = first(vod.getId(), Json.safeString(payload, "vodId"), Json.safeString(payload, "id"), "webhome-" + UUID.randomUUID());
@@ -53,8 +66,54 @@ public class WebHomeInlineVodStore {
         if (vod.getPlayFrom().isEmpty()) vod.setPlayFrom(first(Json.safeString(payload, "vodPlayFrom"), Json.safeString(payload, "playFrom"), "WebHome"));
         if (vod.getPlayUrl().isEmpty()) vod.setPlayUrl(playUrl);
         ITEMS.put(id, new Entry(App.gson().toJson(vod), headerSpec, resolver));
+        VOD_PICS.put(id, vod.getPic());
+        rememberOriginSite(id, originSite);
         persist(id, ITEMS.get(id));
         return id;
+    }
+
+    static void rememberOriginSite(String id, Site site) {
+        if (TextUtils.isEmpty(id)) return;
+        if (site == null || TextUtils.isEmpty(site.getKey())) {
+            ORIGIN_SITES.remove(id);
+            return;
+        }
+        ORIGIN_SITES.put(id, Site.get(site.getKey(), site.getName()));
+    }
+
+    public static Site getOriginSite(String id) {
+        if (TextUtils.isEmpty(id)) return new Site();
+        Site site = ORIGIN_SITES.get(id);
+        if (site == null) {
+            // 进程重启后内存表是空的，Origin 站点随 VOD 一起持久化，按需读回来。
+            loadPersisted(id);
+            site = ORIGIN_SITES.get(id);
+        }
+        return site == null ? new Site() : Site.get(site.getKey(), site.getName());
+    }
+
+    /**
+     * 嗅探 payload 里的网页详情图。历史卡片优先用 TMDB 海报，未命中时用这里兜底。
+     * 没有记录或记录里没有图片时返回空串，不伪造图片地址。
+     */
+    public static String getPic(String id) {
+        if (TextUtils.isEmpty(id)) return "";
+        String cached = VOD_PICS.get(id);
+        if (cached != null) return cached;
+        Entry entry = ITEMS.get(id);
+        if (entry == null) {
+            loadPersisted(id);
+            entry = ITEMS.get(id);
+        }
+        if (entry == null || TextUtils.isEmpty(entry.vod)) return "";
+        try {
+            Vod vod = Vod.objectFrom(entry.vod);
+            String pic = vod == null ? "" : vod.getPic();
+            VOD_PICS.put(id, pic);
+            return pic;
+        } catch (Throwable ignored) {
+            return "";
+        }
     }
 
     public static Result detail(String id) {
@@ -63,6 +122,28 @@ public class WebHomeInlineVodStore {
         if (entry == null || TextUtils.isEmpty(entry.vod)) return Result.error("WebHome inline VOD not found");
         SpiderDebug.log("webhome-inline", "detail id=%s found=%s", id, true);
         return Result.vod(Vod.objectFrom(entry.vod));
+    }
+
+    public static boolean shouldRefreshYoutubeEpisode(String key, String episodeUrl, int statusCode, boolean attempted) {
+        if (!KEY.equals(key) || attempted || (statusCode != 403 && statusCode != 410)) return false;
+        try {
+            String host = URI.create(episodeUrl).getHost();
+            if (host != null) host = host.toLowerCase(Locale.ROOT);
+            return host != null && (host.equals("youtu.be") || host.equals("youtube.com") || host.endsWith(".youtube.com"));
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    public static boolean invalidateResolvedEpisode(String id) {
+        EpisodeSpec episodeSpec = URL_EPISODES.get(id);
+        if (episodeSpec == null || TextUtils.isEmpty(episodeSpec.mediaUrl)) return false;
+        URL_HEADERS.remove(episodeSpec.mediaUrl);
+        URL_EPISODES.put(id, new EpisodeSpec(episodeSpec.payload.deepCopy(), episodeSpec.headerSpec, episodeSpec.resolver, true, "", episodeSpec.format, 0L));
+        String vodId = URL_VOD.get(id);
+        if (!TextUtils.isEmpty(vodId)) persist(vodId, ITEMS.get(vodId));
+        SpiderDebug.log("webhome-inline", "invalidate resolved episode id=%s", id);
+        return true;
     }
 
     public static Result player(String flag, String id) throws Exception {
@@ -107,9 +188,32 @@ public class WebHomeInlineVodStore {
         return result;
     }
 
+    /** 播放器截图兜底成功后回写：历史卡片与下次 detail 都直接用这张本地封面。 */
+    public static boolean setPic(String id, String pic) {
+        if (TextUtils.isEmpty(id) || TextUtils.isEmpty(pic)) return false;
+        Entry entry = ITEMS.get(id);
+        if (entry == null) {
+            loadPersisted(id);
+            entry = ITEMS.get(id);
+        }
+        if (entry == null || TextUtils.isEmpty(entry.vod)) return false;
+        try {
+            Vod vod = Vod.objectFrom(entry.vod);
+            if (vod == null) return false;
+            vod.setPic(pic);
+            Entry updated = new Entry(App.gson().toJson(vod), entry.headerSpec, entry.resolver);
+            ITEMS.put(id, updated);
+            VOD_PICS.put(id, pic);
+            persist(id, updated);
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     /** 写进 Prefers。Resolver 是接口实例，无法序列化，用不到就留空。 */
     private static void persist(String id, Entry entry) {
-        if (entry == null || TextUtils.isEmpty(entry.vod)) return;
+        if (entry == null || TextUtils.isEmpty(entry.vod) || TextUtils.isEmpty(id)) return;
         try {
             JsonObject all = allPersisted();
             JsonObject one = new JsonObject();
@@ -117,6 +221,11 @@ public class WebHomeInlineVodStore {
             one.addProperty("headers", App.gson().toJson(entry.headerSpec.headers));
             one.addProperty("cookies", entry.headerSpec.includeCookies);
             one.addProperty("time", System.currentTimeMillis());
+            Site site = ORIGIN_SITES.get(id);
+            if (site != null && !TextUtils.isEmpty(site.getKey())) {
+                one.addProperty("siteKey", site.getKey());
+                one.addProperty("siteName", site.getName());
+            }
             JsonObject episodes = persistEpisodes(entry.vod);
             if (episodes.size() > 0) one.add("episodes", episodes);
             all.add(id, one);
@@ -152,8 +261,8 @@ public class WebHomeInlineVodStore {
     }
 
     /** vod_play_url 里的每个 $ 后面的串就是 URL_EPISODES 的 key。 */
-    private static java.util.List<String> episodeKeys(String vodJson) {
-        java.util.List<String> keys = new java.util.ArrayList<>();
+    private static List<String> episodeKeys(String vodJson) {
+        List<String> keys = new ArrayList<>();
         if (TextUtils.isEmpty(vodJson)) return keys;
         String playUrl;
         try {
@@ -173,6 +282,7 @@ public class WebHomeInlineVodStore {
     }
 
     private static Entry loadPersisted(String id) {
+        if (TextUtils.isEmpty(id)) return null;
         try {
             JsonObject all = allPersisted();
             JsonElement e = all.get(id);
@@ -185,8 +295,16 @@ public class WebHomeInlineVodStore {
             if (!TextUtils.isEmpty(raw)) headerSpec = new HeaderSpec(parseHeaders(raw, headerSpec.headers), headerSpec.includeCookies);
             Entry entry = new Entry(vod, headerSpec, null);
             ITEMS.put(id, entry);
+            try {
+                Vod parsed = Vod.objectFrom(vod);
+                if (parsed != null) VOD_PICS.put(id, parsed.getPic());
+            } catch (Throwable ignored) {
+            }
+            String siteKey = Json.safeString(o, "siteKey");
+            if (!TextUtils.isEmpty(siteKey)) ORIGIN_SITES.put(id, Site.get(siteKey, Json.safeString(o, "siteName")));
             JsonElement episodes = o.get("episodes");
             if (episodes != null && episodes.isJsonObject()) restoreEpisodes(id, episodes.getAsJsonObject());
+            SpiderDebug.log("webhome-inline", "load persisted id=%s", id);
             return entry;
         } catch (Throwable ignored) {
             return null;
@@ -244,7 +362,7 @@ public class WebHomeInlineVodStore {
     /** 只保留最近 MAX_PERSIST 条，避免 Prefers 无限增长。 */
     private static void trim(JsonObject all) {
         if (all.size() <= MAX_PERSIST) return;
-        java.util.List<String> keys = new java.util.ArrayList<>();
+        List<String> keys = new ArrayList<>();
         for (String k : all.keySet()) keys.add(k);
         keys.sort((a, b) -> Long.compare(time(all, a), time(all, b)));
         while (keys.size() > MAX_PERSIST) all.remove(keys.remove(0));
@@ -257,6 +375,35 @@ public class WebHomeInlineVodStore {
         } catch (Throwable ignored) {
         }
         return 0L;
+    }
+
+    /**
+     * 兜底解析用：按剧集地址取原始 payload（找不到返回 null）。
+     */
+    public static JsonObject episodePayload(String key) {
+        String id = matchId(key);
+        return id == null ? null : URL_EPISODES.get(id).payload.deepCopy();
+    }
+
+    /**
+     * 兜底解析成功后回写缓存，同一集下次直接播直链，不再嗅探。
+     */
+    public static void cacheMedia(String key, JsonObject resolved) {
+        String id = matchId(key);
+        if (id == null || resolved == null) return;
+        if (TextUtils.isEmpty(Json.safeString(resolved, "url"))) return;
+        ResolveResult result = cacheResolved(id, URL_EPISODES.get(id), null, resolved.deepCopy());
+        SpiderDebug.log("webhome-inline", "cache fallback media id=%s url=%s", id, result.url);
+    }
+
+    /** 剧集地址与播放页地址都可能出现在 Result 里，两种都认。 */
+    private static String matchId(String key) {
+        if (TextUtils.isEmpty(key)) return null;
+        if (URL_EPISODES.containsKey(key)) return key;
+        for (Map.Entry<String, EpisodeSpec> entry : URL_EPISODES.entrySet()) {
+            if (key.equals(pageOf(entry.getValue(), entry.getKey()))) return entry.getKey();
+        }
+        return null;
     }
 
     private static Map<String, String> headers(String url, HeaderSpec headerSpec) {
@@ -357,35 +504,7 @@ public class WebHomeInlineVodStore {
         }
         return new ResolveResult(url, headerSpec, format, false);
     }
- 
-    /**
-     * 系统嗅探失败时的兜底入口：按剧集地址（或播放页地址）找回脚本当时给的 payload，
-     * 交给隐藏的 WebHome 实例再解析一次。
-     */
-    public static JsonObject episodePayload(String key) {
-        String id = matchId(key);
-        return id == null ? null : URL_EPISODES.get(id).payload.deepCopy();
-    }
- 
-    /** 兜底解析成功后回写缓存，同一集下次直接播直链，不再嗅探。 */
-    public static void cacheMedia(String key, JsonObject resolved) {
-        String id = matchId(key);
-        if (id == null || resolved == null) return;
-        if (TextUtils.isEmpty(Json.safeString(resolved, "url"))) return;
-        ResolveResult result = cacheResolved(id, URL_EPISODES.get(id), null, resolved.deepCopy());
-        SpiderDebug.log("webhome-inline", "cache fallback media id=%s url=%s", id, result.url);
-    }
- 
-    /** 剧集地址与播放页地址都可能出现在 Result 里，两种都认。 */
-    private static String matchId(String key) {
-        if (TextUtils.isEmpty(key)) return null;
-        if (URL_EPISODES.containsKey(key)) return key;
-        for (Map.Entry<String, EpisodeSpec> entry : URL_EPISODES.entrySet()) {
-            if (key.equals(pageOf(entry.getValue(), entry.getKey()))) return entry.getKey();
-        }
-        return null;
-    }
- 
+
     /** 直链缓存是否还能用：带时间戳的按 TTL 判，本次会话内解析的（无时间戳）直接用。 */
     private static boolean fresh(EpisodeSpec episodeSpec) {
         if (TextUtils.isEmpty(episodeSpec.mediaUrl)) return false;

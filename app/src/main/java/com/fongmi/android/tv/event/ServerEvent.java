@@ -12,10 +12,6 @@ public record ServerEvent(Type type, String text, String name) {
         EventBus.getDefault().post(new ServerEvent(Type.PUSH, text));
     }
 
-    public static void push(String text, String name) {
-        EventBus.getDefault().post(new ServerEvent(Type.PUSH, text, name));
-    }
- 
     public static void setting(String text) {
         EventBus.getDefault().post(new ServerEvent(Type.SETTING, text));
     }

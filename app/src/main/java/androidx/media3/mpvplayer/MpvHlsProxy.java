@@ -4,8 +4,18 @@ import android.os.SystemClock;
 import android.text.TextUtils;
 
 import androidx.annotation.Nullable;
-import androidx.media3.exoplayer.hls.playlist.HlsAdsParser;
+import com.fongmi.android.tv.App;
+import com.fongmi.android.tv.api.config.AdBlockStatsStore;
+import com.fongmi.android.tv.api.config.HlsRuleConfig;
+import com.fongmi.android.tv.utils.HlsAdblockNotice;
+import com.fongmi.android.tv.utils.HlsAdblockPipeline;
+import com.fongmi.android.tv.utils.HlsManifestCleaner;
+import com.fongmi.android.tv.utils.Notify;
 
+import com.fongmi.android.tv.cache.CacheCenter;
+import com.fongmi.android.tv.cache.CacheModuleId;
+import com.fongmi.android.tv.cache.CachePolicyStore;
+import com.fongmi.android.tv.cache.PlaybackCacheBudget;
 import com.fongmi.android.tv.player.PlaybackAutoContext;
 import com.fongmi.android.tv.player.PlaybackRouteRegistry;
 import com.fongmi.android.tv.player.PlaybackResourceClassifier;
@@ -93,6 +103,7 @@ public final class MpvHlsProxy extends NanoHTTPD {
     private final Map<Integer, Session> sessions;
     private final Map<Integer, SessionStats> sessionStats;
     private final Map<String, Target> targets;
+    private final Map<String, byte[]> keyMaterial;
     private final AtomicLong nextId;
     private final java.util.Set<String> preloading;
     private final MpvHlsPreloadGate preloadGate;
@@ -128,6 +139,7 @@ public final class MpvHlsProxy extends NanoHTTPD {
         sessions = new ConcurrentHashMap<>();
         sessionStats = new ConcurrentHashMap<>();
         targets = new ConcurrentHashMap<>();
+        keyMaterial = new ConcurrentHashMap<>();
         nextId = new AtomicLong();
         preloading = ConcurrentHashMap.newKeySet();
         preloadGate = new MpvHlsPreloadGate();
@@ -263,6 +275,7 @@ public final class MpvHlsProxy extends NanoHTTPD {
         sessions.clear();
         sessionStats.clear();
         targets.clear();
+        keyMaterial.clear();
         upstreamEstimator.reset();
         lastManualPreloadPositionMs = Long.MIN_VALUE;
         lastManualPreloadAtMs = 0;
@@ -317,6 +330,7 @@ public final class MpvHlsProxy extends NanoHTTPD {
 
     public synchronized void release() {
         clear();
+        boolean hadSession = started;
         try {
             if (started) stop();
         } finally {
@@ -325,6 +339,7 @@ public final class MpvHlsProxy extends NanoHTTPD {
             if (cacheClient != null) cacheClient.close();
             cacheClient = null;
             started = false;
+            if (hadSession) pruneToIdleBudget();
         }
     }
 
@@ -441,8 +456,31 @@ public final class MpvHlsProxy extends NanoHTTPD {
     }
 
     PreloadRuntimeSnapshot preloadRuntimeSnapshot(long nowElapsedMs) {
-        refreshCacheCoordinator();
         SessionStats stats = sessionStats.get(sessionId);
+        if (stats == null || !stats.vod) {
+            return new PreloadRuntimeSnapshot(
+                    PreloadSetting.isPreload(kernel),
+                    false,
+                    0,
+                    false,
+                    false,
+                    -1,
+                    -1,
+                    0,
+                    0,
+                    "none",
+                    preloadGate.foregroundRequests(),
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    preloading.size());
+        }
+        refreshCacheCoordinator();
         MpvHlsUpstreamEstimator.Snapshot throughput =
                 upstreamEstimator.snapshot(nowElapsedMs);
         MpvHlsCacheCoordinator.PreloadCapacitySnapshot preloadCapacity =
@@ -756,6 +794,11 @@ public final class MpvHlsProxy extends NanoHTTPD {
                     type == null ? null : type.toString(),
                     target.role() == HlsPlaylistRewriter.UriRole.MEDIA_SEGMENT);
             recordItemResponse(target.sessionId, response.code(), target.url);
+            if (target.decryptable() && response.isSuccessful()) {
+                Response decrypted = serveDecryptedSegment(owner, target, body, response, foreground);
+                foregroundHandedOff = true;
+                return decrypted;
+            }
             long contentLength = body.contentLength();
             String mime = mayStripPngPrefix ? MIME_TS : mediaMimeFor(target.url, finalUrl, type);
             InputStream source = body.byteStream();
@@ -779,8 +822,8 @@ public final class MpvHlsProxy extends NanoHTTPD {
                         ? newChunkedResponse(streamingStatus, mime, stream)
                         : newFixedLengthResponse(streamingStatus, mime, stream, contentLength);
                 addStreamingHeaders(result, response, forwardedRange);
-                SpiderDebug.log(TAG, "item id=%s code=%d range=%s contentRange=%s length=%d mime=%s url=%s",
-                        id, response.code(), forwardedRange, response.header("Content-Range"), contentLength, mime, shortUrl(target.url));
+                SpiderDebug.log(TAG, "item id=%s code=%d role=%s range=%s contentRange=%s length=%d mime=%s url=%s",
+                        id, response.code(), target.role(), forwardedRange, response.header("Content-Range"), contentLength, mime, shortUrl(target.url));
                 return result;
             } catch (Throwable error) {
                 try {
@@ -792,6 +835,75 @@ public final class MpvHlsProxy extends NanoHTTPD {
             }
         } finally {
             if (!foregroundHandedOff) foreground.close();
+        }
+    }
+
+    /**
+     * Fetches the whole segment, decrypts it, and answers with the plaintext. The player therefore
+     * never needs its own AES support, which the packaged IJK runtime lacks.
+     */
+    private Response serveDecryptedSegment(
+            Session session,
+            Target target,
+            ResponseBody body,
+            okhttp3.Response response,
+            ForegroundLease foreground) throws IOException {
+        HlsPlaylistRewriter.EncryptionKey key = target.key();
+        byte[] material = key == null ? null : keyBytes(session, key);
+        if (material == null) {
+            SpiderDebug.log(TAG, "aes128 key unavailable id=%s url=%s",
+                    target.url, shortUrl(target.url));
+            body.close();
+            response.close();
+            foreground.close();
+            return error(Status.INTERNAL_ERROR, "key unavailable");
+        }
+        byte[] ciphertext;
+        try (response; body) {
+            ciphertext = body.bytes();
+        }
+        byte[] iv = key.explicitIv() != null
+                ? key.explicitIv()
+                : HlsSegmentDecryptor.sequenceIv(target.mediaSequence());
+        byte[] plain = HlsSegmentDecryptor.decrypt(material, iv, ciphertext);
+        if (plain == null) {
+            SpiderDebug.log(TAG, "aes128 decrypt failed bytes=%d seq=%d url=%s",
+                    ciphertext.length, target.mediaSequence(), shortUrl(target.url));
+            foreground.close();
+            return error(Status.INTERNAL_ERROR, "decrypt failed");
+        }
+        foreground.close();
+        SpiderDebug.log(TAG, "aes128 segment bytes=%d->%d seq=%d url=%s",
+                ciphertext.length, plain.length, target.mediaSequence(), shortUrl(target.url));
+        Response result = newFixedLengthResponse(Status.OK, MIME_TS,
+                new ByteArrayInputStream(plain), plain.length);
+        addStreamingHeaders(result, response, null);
+        return result;
+    }
+
+    @Nullable
+    private byte[] keyBytes(Session session, HlsPlaylistRewriter.EncryptionKey key) {
+        String uri = key.uri();
+        if (uri == null || uri.isEmpty()) return null;
+        byte[] cached = keyMaterial.get(uri);
+        if (cached != null) return cached;
+        try (okhttp3.Response response = fetch(session, uri, null, false)) {
+            if (!response.isSuccessful()) {
+                SpiderDebug.log(TAG, "aes128 key http=%d url=%s", response.code(), shortUrl(uri));
+                return null;
+            }
+            ResponseBody body = response.body();
+            if (body == null) return null;
+            byte[] bytes = body.bytes();
+            if (bytes.length != 16) {
+                SpiderDebug.log(TAG, "aes128 key size=%d url=%s", bytes.length, shortUrl(uri));
+                return null;
+            }
+            keyMaterial.put(uri, bytes);
+            return bytes;
+        } catch (Throwable e) {
+            SpiderDebug.log(TAG, "aes128 key failed errorType=%s", e.getClass().getSimpleName());
+            return null;
         }
     }
 
@@ -809,49 +921,99 @@ public final class MpvHlsProxy extends NanoHTTPD {
     private String applyAdblock(String text, int session, String url,
             @Nullable HlsPlaylistRewriter.Variant variant, boolean videoPlaylist) {
         if (!Setting.isAdblock() || !isVodPlaylist(text)) return text;
+        if (HlsAdblockPipeline.isCoreM3u8Proxy(url)) return text;
         if (kernel == PlayerSetting.MPV && !videoPlaylist) return text;
         try {
-            String filtered = HlsAdsParser.process(text);
+            List<HlsManifestCleaner.Rule> rules = HlsRuleConfig.getRules();
+            boolean legacyFallback = HlsRuleConfig.isLegacyFallbackEnabled();
+            HlsAdblockPipeline.Outcome outcome = HlsAdblockPipeline.apply(url, text, rules, legacyFallback);
             if (kernel == PlayerSetting.MPV) {
-                HlsAdTimeline timeline = HlsAdTimeline.from(text, filtered);
+                HlsAdTimeline timeline = HlsAdTimeline.from(text, outcome.manifest());
                 SessionStats stats = sessionStats.get(session);
                 if (stats != null) {
                     if (variant == null) stats.directAdTimeline = timeline;
                     else stats.adTimelines.merge(variant, timeline,
                             (previous, next) -> previous.sameCuts(next) ? previous : HlsAdTimeline.NONE);
                 }
-                if (!TextUtils.equals(filtered, text)) {
+                if (!TextUtils.equals(outcome.manifest(), text)) {
                     SpiderDebug.log(TAG,
                             "adblock planned session=%d ranges=%d cuts=%s mode=source-timeline-seek reason=%s url=%s",
                             session, timeline.ranges().size(), timeline.ranges(), timeline.reason(), shortUrl(url));
                 }
                 // Keep timestamps, implicit AES IVs, byte ranges and rendition
                 // synchronization intact; MpvPlayer skips the detected time ranges.
+                // Notify as soon as a valid removal plan is available so MPV has the
+                // same user-visible adblock confirmation as Exo. Runtime skip
+                // accounting remains separate and is recorded only after playback.
+                if (!TextUtils.equals(outcome.manifest(), text)) {
+                    recordAndNotifyAdblock(url, outcome);
+                }
                 return text;
             }
-            if (!TextUtils.equals(filtered, text)) {
-                SpiderDebug.log(TAG,
-                        "adblock filtered session=%d bytes=%d->%d url=%s",
-                        session, text.length(), filtered.length(), shortUrl(url));
+            if (!TextUtils.equals(outcome.manifest(), text)) {
+                SpiderDebug.log(TAG, "adblock filtered session=%d bytes=%d->%d structured=%s legacy=%s url=%s",
+                        session, text.length(), outcome.manifest().length(), outcome.structured(), outcome.legacy(), shortUrl(url));
             }
-            return filtered;
+            recordAndNotifyAdblock(url, outcome);
+            return outcome.manifest();
         } catch (Throwable e) {
             SpiderDebug.log(TAG, "adblock ignored session=%d errorType=%s", session, e.getClass().getSimpleName());
             return text;
         }
     }
 
+    private void recordAndNotifyAdblock(String url, HlsAdblockPipeline.Outcome outcome) {
+        if (!outcome.structured() && !outcome.legacy()) return;
+        okhttp3.HttpUrl parsed = okhttp3.HttpUrl.parse(url);
+        if (parsed == null) return;
+        long fallbackCount = outcome.legacy() ? Math.max(1, outcome.removedSegments()) : 0;
+        String pipeline = kernel == PlayerSetting.IJK ? "IJK" : "MPV";
+        AdBlockStatsStore.recordBlocks(parsed.host(), pipeline, outcome.ruleCounts(), fallbackCount,
+                parsed.host(), outcome.removedDurationSec(), outcome.removedSegmentDetails());
+        if (!HlsAdblockNotice.shouldNotify(url, System.currentTimeMillis())) return;
+        int removed = outcome.removedSegments() > 0 ? outcome.removedSegments() : (int) fallbackCount;
+        String message = HlsAdblockNotice.message(removed, outcome.removedDurationSec());
+        App.post(() -> Notify.show(message));
+    }
+
     private String rewritePlaylist(String playlistUrl, String text, int session, @Nullable HlsPlaylistRewriter.Variant inheritedVariant) {
+        // The packaged IJK runtime fails to open AES-128 playlists (AVERROR_INVALIDDATA before the
+        // first segment request), so the proxy decrypts those segments itself and hides the key.
+        // The key is resolved before the rewrite because that pass registers the segment targets
+        // which must carry it, and it stays scoped to this playlist: one session can serve several
+        // playlists, so a session-wide key would decrypt the segments of a playlist that declares
+        // no encryption. Byte-range segments are excluded: their ciphertext arrives in fragments
+        // that cannot be decrypted without reassembly, so they keep previous behaviour.
+        HlsPlaylistRewriter.EncryptionKey declared = kernel == PlayerSetting.IJK
+                ? HlsPlaylistRewriter.findAes128Key(text) : null;
+        HlsPlaylistRewriter.EncryptionKey segmentKey = declared == null
+                || text.toUpperCase(Locale.US).contains("#EXT-X-BYTERANGE")
+                ? null
+                : new HlsPlaylistRewriter.EncryptionKey(
+                        declared.method(), resolve(playlistUrl, declared.uri()),
+                        declared.explicitIv());
+        boolean decryptSegments = segmentKey != null;
+        if (decryptSegments) {
+            SpiderDebug.log(TAG, "aes128 decrypt session=%d iv=%s", session,
+                    segmentKey.explicitIv() != null ? "explicit" : "sequence");
+        }
         HlsPlaylistRewriter.Result result = HlsPlaylistRewriter.rewrite(text, inheritedVariant, (uri, cacheable, context) -> {
             String targetUrl = resolve(playlistUrl, uri);
             HlsPlaylistRewriter.Variant targetVariant = context.variant();
             String rewrittenUrl = proxyItemUrl(
                     targetUrl, session, cacheable, targetVariant,
                     context.role(), context.startSeconds(),
-                    context.durationSeconds());
+                    context.durationSeconds(), context.mediaSequence(), segmentKey);
             return new HlsPlaylistRewriter.MappedUri(targetUrl, rewrittenUrl);
-        });
+        }, decryptSegments);
         recordPlaylistDetails(session, playlistUrl, text, result, inheritedVariant);
+        if (kernel == PlayerSetting.IJK) logPlaylistDump(session, result.text());
+        SpiderDebug.log(TAG,
+                "playlist shape session=%d master=%s key=%s map=%s byterange=%s segments=%d variants=%d units=%d url=%s",
+                session, text.contains("#EXT-X-STREAM-INF"), text.contains("#EXT-X-KEY"),
+                text.contains("#EXT-X-MAP"), text.contains("#EXT-X-BYTERANGE"),
+                result.segments().size(), result.variants().size(), result.mediaUnits().size(),
+                shortUrl(playlistUrl));
         if (!result.variants().isEmpty()) {
             SpiderDebug.log(TAG, "master playlist preserved variants session=%d variants=%d", session, result.variants().size());
         }
@@ -865,12 +1027,16 @@ public final class MpvHlsProxy extends NanoHTTPD {
             @Nullable HlsPlaylistRewriter.Variant variant,
             HlsPlaylistRewriter.UriRole role,
             double startSeconds,
-            double durationSeconds) {
+            double durationSeconds,
+            long mediaSequence,
+            @Nullable HlsPlaylistRewriter.EncryptionKey key) {
         String id = MpvHlsTargetIdentity.stableId(
                 session, targetUrl, cacheable, variant, role);
+        HlsPlaylistRewriter.EncryptionKey segmentKey =
+                role == HlsPlaylistRewriter.UriRole.MEDIA_SEGMENT ? key : null;
         targets.put(id, new Target(
                 session, targetUrl, System.currentTimeMillis(), cacheable,
-                variant, role, startSeconds, durationSeconds));
+                variant, role, startSeconds, durationSeconds, segmentKey, mediaSequence));
         return baseUrl() + "/mpv/item?s=" + session + "&id=" + id;
     }
 
@@ -1242,6 +1408,35 @@ public final class MpvHlsProxy extends NanoHTTPD {
         cacheCoordinator.prune(configuredCacheLimitBytes());
     }
 
+    /**
+     * Converges the MPV HLS disk cache once playback ends.
+     *
+     * <p>Opening a proxy session prunes with the playback limit, which stays deliberately
+     * generous. Only the end of playback applies the shared total limit: the coordinator keeps the
+     * smaller of the requested capacity and every registered client, and this runs after the
+     * client lease was closed, so the budget is what takes effect. Pruning walks the directory and
+     * deletes spans, so it never runs on the thread that is tearing the player down.</p>
+     */
+    private void pruneToIdleBudget() {
+        long totalLimitBytes = CachePolicyStore.getTotalLimitBytes();
+        // Without a total limit the idle budget equals the playback one, which the session already
+        // pruned to; walking the directory again would only repeat that work on every release.
+        if (totalLimitBytes <= 0) return;
+        MpvHlsCacheCoordinator coordinator = cacheCoordinator;
+        long budget = PlaybackCacheBudget.capacityBytes(false, totalLimitBytes,
+                configuredCacheLimitBytes(),
+                CacheCenter.get().cachedOthersBytes(CacheModuleId.MPV_HLS));
+        Thread thread = new Thread(() -> {
+            try {
+                coordinator.prune(budget);
+            } catch (Throwable error) {
+                // An escaping error here would kill the process, and pruning is best-effort.
+                SpiderDebug.log(TAG, "idle-prune budget=%d error=%s", budget, error.getClass().getSimpleName());
+            }
+        }, "mpv-hls-idle-prune");
+        thread.start();
+    }
+
     private long cacheBytes() {
         return cacheCoordinator.cacheBytes();
     }
@@ -1589,6 +1784,53 @@ public final class MpvHlsProxy extends NanoHTTPD {
         return Double.isFinite(value) ? Math.max(0, value) : 0;
     }
 
+    /**
+     * Shape-only view of the playlist handed to IJK: enough to tell whether a tag the demuxer needs
+     * is missing, without exporting any URL or key material.
+     */
+    private void logPlaylistDump(int session, String rewritten) {
+        Map<String, Integer> tags = new LinkedHashMap<>();
+        List<String> keys = new ArrayList<>();
+        int segmentUris = 0;
+        int localUris = 0;
+        int extinf = 0;
+        for (String line : rewritten.split("\n", -1)) {
+            String value = line.trim();
+            if (value.isEmpty()) continue;
+            if (!value.startsWith("#")) {
+                segmentUris++;
+                if (value.startsWith("http://127.0.0.1")) localUris++;
+                continue;
+            }
+            if (value.startsWith("#EXTINF")) {
+                extinf++;
+                continue;
+            }
+            String name = value.split(":", 2)[0];
+            tags.merge(name, 1, Integer::sum);
+            if ("#EXT-X-KEY".equals(name)) keys.add(describeKey(value));
+        }
+        SpiderDebug.log(TAG,
+                "playlist dump session=%d extinf=%d segmentUris=%d localUris=%d tags=%s keys=%s",
+                session, extinf, segmentUris, localUris, tags, keys);
+    }
+
+    /** Keeps METHOD/IV presence and whether the key URI stays remote; drops the URL itself. */
+    private static String describeKey(String line) {
+        StringBuilder out = new StringBuilder();
+        for (String part : line.substring("#EXT-X-KEY:".length()).split(",")) {
+            String attribute = part.trim();
+            if (attribute.startsWith("URI=")) {
+                out.append("URI=")
+                        .append(attribute.contains("127.0.0.1") ? "local" : "remote")
+                        .append(' ');
+            } else if (!attribute.isEmpty()) {
+                out.append(attribute).append(' ');
+            }
+        }
+        return out.toString().trim();
+    }
+
     private void logCacheFailure(String action, Throwable error) {
         String type = error == null ? "unknown" : error.getClass().getSimpleName();
         MpvHlsCacheCoordinator.CapacitySnapshot snapshot = cacheCoordinator.snapshot(configuredCacheLimitBytes());
@@ -1609,7 +1851,22 @@ public final class MpvHlsProxy extends NanoHTTPD {
             @Nullable HlsPlaylistRewriter.Variant variant,
             HlsPlaylistRewriter.UriRole role,
             double startSeconds,
-            double durationSeconds) {
+            double durationSeconds,
+            @Nullable HlsPlaylistRewriter.EncryptionKey key,
+            long mediaSequence) {
+
+        Target(
+                int sessionId,
+                String url,
+                long createdAtMs,
+                boolean cacheable,
+                @Nullable HlsPlaylistRewriter.Variant variant,
+                HlsPlaylistRewriter.UriRole role,
+                double startSeconds,
+                double durationSeconds) {
+            this(sessionId, url, createdAtMs, cacheable, variant, role,
+                    startSeconds, durationSeconds, null, -1);
+        }
 
         private Target {
             role = role == null
@@ -1620,6 +1877,11 @@ public final class MpvHlsProxy extends NanoHTTPD {
 
         private double endSeconds() {
             return startSeconds + durationSeconds;
+        }
+
+        /** True when this segment must be decrypted by the proxy before the player sees it. */
+        private boolean decryptable() {
+            return key != null && key.aes128() && mediaSequence >= 0;
         }
     }
 

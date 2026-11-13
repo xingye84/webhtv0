@@ -233,14 +233,14 @@ public class Path {
         if (dir == null || !dir.exists()) return;
         if (dir.isDirectory()) {
             for (File file : list(dir)) {
-                if(file.isDirectory() && skipDirNames != null && skipDirNames.contains(file.getName())){
+                if (file.isDirectory() && skipDirNames != null && skipDirNames.contains(file.getName())) {
                     Logger.t(TAG).d("Skip dir:" + file);
                     continue;
                 }
                 clear(file, skipDirNames);
             }
         }
-        if(!dir.isDirectory() || !dir.equals(cache())){
+        if (!dir.isDirectory() || !dir.equals(cache())) {
             if (dir.delete()) Logger.t(TAG).d("Deleted:" + dir);
         }
     }

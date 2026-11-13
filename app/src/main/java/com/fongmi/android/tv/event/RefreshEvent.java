@@ -30,6 +30,10 @@ public class RefreshEvent {
         EventBus.getDefault().post(new RefreshEvent(Type.SIZE));
     }
 
+    public static void uiScale() {
+        EventBus.getDefault().post(new RefreshEvent(Type.UI_SCALE));
+    }
+
     public static void theme() {
         EventBus.getDefault().post(new RefreshEvent(Type.THEME));
     }
@@ -50,6 +54,16 @@ public class RefreshEvent {
         EventBus.getDefault().post(new RefreshEvent(Type.PLAYER));
     }
 
+    /**
+     * Signals that cache contents changed (for example a cleanup finished).
+     *
+     * <p>Cache surfaces such as the settings row only re-read the inventory when told to, so
+     * without this event a cleanup result stays invisible until the screen is left and re-entered.</p>
+     */
+    public static void cache() {
+        EventBus.getDefault().post(new RefreshEvent(Type.CACHE));
+    }
+
     public static void subtitle(String path) {
         EventBus.getDefault().post(new RefreshEvent(Type.SUBTITLE, path));
     }
@@ -59,7 +73,27 @@ public class RefreshEvent {
     }
 
     public static void vod(Vod vod) {
-        EventBus.getDefault().post(new RefreshEvent(Type.VOD, vod));
+        EventBus.getDefault().post(new RefreshEvent(Type.VOD_CORE, vod));
+    }
+
+    public static void vodCore(Vod vod) {
+        EventBus.getDefault().post(new RefreshEvent(Type.VOD_CORE, vod));
+    }
+
+    public static void vodRecommendations(Vod vod) {
+        EventBus.getDefault().post(new RefreshEvent(Type.VOD_RECOMMENDATIONS, vod));
+    }
+
+    public static void vodPersonal(Vod vod) {
+        EventBus.getDefault().post(new RefreshEvent(Type.VOD_PERSONAL, vod));
+    }
+
+    public static void vodEpisodeTitles(Vod vod) {
+        EventBus.getDefault().post(new RefreshEvent(Type.VOD_EPISODE_TITLES, vod));
+    }
+
+    public static void vodRelatedVideos(Vod vod) {
+        EventBus.getDefault().post(new RefreshEvent(Type.VOD_RELATED_VIDEOS, vod));
     }
 
     private RefreshEvent(Type type) {
@@ -89,6 +123,7 @@ public class RefreshEvent {
     }
 
     public enum Type {
-        HOME, CATEGORY, HISTORY, KEEP, SIZE, THEME, LANGUAGE, LIVE, DETAIL, PLAYER, SUBTITLE, DANMAKU, VOD
+        HOME, CATEGORY, HISTORY, KEEP, SIZE, UI_SCALE, THEME, LANGUAGE, LIVE, DETAIL, PLAYER, SUBTITLE, DANMAKU,
+        VOD, VOD_CORE, VOD_RECOMMENDATIONS, VOD_PERSONAL, VOD_EPISODE_TITLES, VOD_RELATED_VIDEOS, CACHE
     }
 }

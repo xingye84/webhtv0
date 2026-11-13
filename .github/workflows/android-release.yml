@@ -8,7 +8,7 @@ on:
         required: false
         type: string
       release_channel:
-        description: "Release channel, auto uses beta on fongmi-sync"
+        description: "Release channel, auto uses beta on dev/fongmi-sync and stable on main"
         required: false
         default: auto
         type: choice
@@ -26,17 +26,21 @@ on:
         default: false
         type: boolean
       sync_cnb:
-        description: "Mirror APKs to CNB Release and sync CNB manifests"
+        description: "Optionally mirror APKs to CNB Release and sync CNB manifests"
         required: false
         default: false
         type: boolean
       publish_oci:
         description: "Publish APKs as OCI artifacts when Registry variables and secrets are configured"
         required: false
-        default: true
+        default: false
 
 permissions:
   contents: write
+
+concurrency:
+  group: android-release-update-channel
+  cancel-in-progress: false
 
 env:
   TZ: Asia/Shanghai
@@ -46,7 +50,7 @@ env:
   CNB_REPO_URL: https://cnb.cool/fish2035/webhtv-release.git
   GRADLE_DAEMON_JVM_DOWNLOAD: false
   GRADLE_OPTS: "-Dorg.gradle.java.installers.download=false"
-  
+
 jobs:
   release:
     name: Build and publish
@@ -85,14 +89,33 @@ jobs:
       - name: Install Android packages
         run: |
           yes | sdkmanager --licenses
-          yes | sdkmanager "platform-tools" "platforms;android-37.0" "build-tools;37.0.0"
+          # API 37 is not published in sdkmanager's stable channel; install the platform archive directly.
+          sdkmanager "platform-tools" "platforms;android-28" "build-tools;36.0.0"
+          curl -fsSL -o /tmp/platform-37.zip https://dl.google.com/android/repository/platform-37.0_r01.zip
+          rm -rf /tmp/platform-37 "$ANDROID_HOME/platforms/android-37"
+          mkdir -p /tmp/platform-37 "$ANDROID_HOME/platforms"
+          unzip -q /tmp/platform-37.zip -d /tmp/platform-37
+          platform_jar="$(find /tmp/platform-37 -name android.jar -print -quit)"
+          test -n "$platform_jar"
+          mv "$(dirname "$platform_jar")" "$ANDROID_HOME/platforms/android-37"
 
-      - name: Run WebSocket danmaku tests
+      - name: Run release-critical tests
         run: |
           chmod +x ./gradlew
           ./gradlew \
             :app:testMobileArm64_v8aDebugUnitTest \
             --tests 'com.fongmi.android.tv.player.danmaku.*' \
+            --tests 'com.fongmi.android.tv.UpdateChannelTest' \
+            --tests 'com.fongmi.android.tv.UpdaterFutureTest' \
+            --tests 'com.fongmi.android.tv.utils.GithubTest' \
+            --tests 'com.fongmi.android.tv.utils.GithubProxyTest' \
+            --tests 'com.fongmi.android.tv.ui.dialog.AboutDialogLayoutTest' \
+            --tests 'com.fongmi.android.tv.ui.dialog.UpdateDialogChannelVisibilityTest' \
+            --tests 'com.fongmi.android.tv.ui.adapter.VodAdapterLayoutTest' \
+            --no-daemon
+          ./gradlew \
+            :app:testLeanbackArm64_v8aDebugUnitTest \
+            --tests 'com.fongmi.android.tv.ui.dialog.UpdateDialogLayoutTest' \
             --no-daemon
 
       - name: Resolve release tag
@@ -102,21 +125,23 @@ jobs:
           VERSION_CODE="$(sed -n 's/^[[:space:]]*versionCode[[:space:]]*\([0-9][0-9]*\).*/\1/p' app/build.gradle | head -1)"
           CHANNEL="${{ inputs.release_channel }}"
           if [ "$CHANNEL" = "auto" ] || [ -z "$CHANNEL" ]; then
-            if [ "${{ github.ref_name }}" = "fongmi-sync" ]; then
+            if [ "${{ github.ref_name }}" = "dev" ] || [ "${{ github.ref_name }}" = "fongmi-sync" ]; then
               CHANNEL="beta"
             else
               CHANNEL="stable"
             fi
           fi
+          COMMIT_EPOCH="$(git show -s --format=%ct "$GITHUB_SHA")"
+          TAG_TIME="$(date -d "@$COMMIT_EPOCH" +%Y%m%d%H%M)"
           if [ "$CHANNEL" = "beta" ]; then
             APK_SUFFIX="-beta"
             TAG_PATTERN="^v${VERSION_NAME}-beta-[0-9]{12}$"
-            TAG_DEFAULT="v${VERSION_NAME}-beta-$(date +%Y%m%d%H%M)"
+            TAG_DEFAULT="v${VERSION_NAME}-beta-$TAG_TIME"
             TAG_EXPECT="v${VERSION_NAME}-beta-yyyyMMddHHmm"
           else
             APK_SUFFIX=""
             TAG_PATTERN="^v${VERSION_NAME}-[0-9]{12}$"
-            TAG_DEFAULT="v${VERSION_NAME}-$(date +%Y%m%d%H%M)"
+            TAG_DEFAULT="v${VERSION_NAME}-$TAG_TIME"
             TAG_EXPECT="v${VERSION_NAME}-yyyyMMddHHmm"
           fi
           TAG="${{ inputs.release_tag }}"
@@ -127,9 +152,12 @@ jobs:
             echo "::error title=Invalid release tag::Expected $TAG_EXPECT, got: $TAG"
             exit 1
           fi
-          if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "::error title=Release tag exists::$TAG already exists"
-            exit 1
+          if EXISTING_TAG_SHA="$(git rev-parse "$TAG^{commit}" 2>/dev/null)"; then
+            if [ "$EXISTING_TAG_SHA" != "$GITHUB_SHA" ]; then
+              echo "::error title=Existing release tag targets another commit::$TAG points to $EXISTING_TAG_SHA, expected $GITHUB_SHA"
+              exit 1
+            fi
+            echo "::notice title=Reusing release tag::$TAG already points to this commit"
           fi
           {
             echo "tag=$TAG"
@@ -187,11 +215,15 @@ jobs:
         run: |
           chmod +x ./gradlew
           rm -rf Release/apk
+          # 与 fish 相同的单次并行调用；仅加 --max-workers=2 护栏：fork 比 fish 多
+          # nodejs 模块与更多依赖，R8 峰值内存更高，4 worker 全并行时在标准 runner
+          # 上会被系统 OOM 杀掉（无堆栈的 IncrementalSplitterRunnable 失败）。
           ./gradlew \
             :app:assembleMobileArm64_v8aRelease \
             :app:assembleMobileArmeabi_v7aRelease \
             :app:assembleLeanbackArm64_v8aRelease \
             :app:assembleLeanbackArmeabi_v7aRelease \
+            --max-workers=2 \
             --no-daemon
 
       - name: Collect artifacts
@@ -205,7 +237,7 @@ jobs:
         id: oras
         if: ${{ inputs.publish_oci }}
         continue-on-error: true
-        uses: oras-project/setup-oras@v1
+        uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
         with:
           url: https://github.com/oras-project/oras/releases/download/v1.3.4/oras_1.3.4_linux_amd64.tar.gz
           checksum: f27adb935022d94df8dc77719c322dda592c78a0d57a6f7dcdd8d900b248c454
@@ -316,12 +348,16 @@ jobs:
             PRERELEASE_FLAG="--prerelease"
           fi
           NOTES="${RELEASE_NOTES:-手动触发 GitHub Actions 构建发布。}"
-          gh release create "${{ steps.meta.outputs.tag }}" \
-            --target "$GITHUB_SHA" \
-            --title "${{ steps.meta.outputs.title }}" \
-            --notes "$NOTES" \
-            $PRERELEASE_FLAG \
-            dist/*.apk dist/*.json
+          if gh release view "${{ steps.meta.outputs.tag }}" >/dev/null 2>&1; then
+            gh release upload "${{ steps.meta.outputs.tag }}" dist/*.apk dist/*.json --clobber
+          else
+            gh release create "${{ steps.meta.outputs.tag }}" \
+              --target "$GITHUB_SHA" \
+              --title "${{ steps.meta.outputs.title }}" \
+              --notes "$NOTES" \
+              $PRERELEASE_FLAG \
+              dist/*.apk dist/*.json
+          fi
 
       - name: Sync to CNB
         if: ${{ inputs.sync_cnb }}

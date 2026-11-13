@@ -35,6 +35,12 @@ public final class MpvPerformanceSetting {
     public static final int VULKAN_BACKEND_LEGACY = 2;
     public static final int VULKAN_BACKEND_STABLE = 3;
 
+    // 自动电视直出只由「设备是否支持零拷贝」决定，不再有全局暂停开关。
+    // 历史上 506639c9b0 曾用全局 kill switch 暂停自动直出（当时 native Surface 拆除
+    // 尚未加固），但 22f2333317 已明确要求生产环境保留自动直出，且 P4-1/P4-3 已修好
+    // 拆除与终态释放；残留的开关会让自动档在电视上永久退化为 GPU 合成 + 拷贝，
+    // 4K 高帧率下更容易掉帧/音频欠载。
+    private static final boolean ZERO_COPY_DEVICE_GUARD_ENABLED = true;
     private static final String KEY_OUTPUT_MODE = "perf_mpv_output_mode";
     private static final String KEY_HWDEC = "perf_mpv_hwdec";
     private static final String KEY_SYNC = "perf_mpv_sync";
@@ -64,11 +70,26 @@ public final class MpvPerformanceSetting {
     }
 
     public static String getOutputModeText() {
-        return switch (getOutputMode()) {
+        int mode = getOutputMode();
+        if (mode == OUTPUT_SURFACE_DIRECT && isZeroCopyBlocked()) return "电视直出（设备保护：GPU）";
+        return switch (mode) {
             case OUTPUT_GPU -> "GPU渲染";
             case OUTPUT_SURFACE_DIRECT -> "电视直出";
             default -> "自动";
         };
+    }
+
+    /**
+     * 自动档是否允许进入电视直出。只剩设备级零拷贝保护这一个否决条件：
+     * 命中 {@link MpvHardwarePolicy} 的已知不兼容设备（Kirin/HiSilicon、x86 转译、
+     * 模拟器）时仍强制 GPU + 兼容复制，其余设备恢复自动直出。
+     */
+    public static boolean isAutoSurfaceDirectEnabled() {
+        return !isZeroCopyBlocked();
+    }
+
+    public static boolean isZeroCopyBlocked() {
+        return ZERO_COPY_DEVICE_GUARD_ENABLED && MpvHardwarePolicy.blocksZeroCopy();
     }
 
     public static boolean shouldUseSurfaceDirect(boolean autoEligible, boolean leanback, boolean hardDecode) {
@@ -76,7 +97,11 @@ public final class MpvPerformanceSetting {
     }
 
     static boolean resolveSurfaceDirect(int outputMode, boolean autoEligible, boolean leanback, boolean hardDecode) {
-        if (!hardDecode) return false;
+        return resolveSurfaceDirect(outputMode, autoEligible, leanback, hardDecode, isZeroCopyBlocked());
+    }
+
+    static boolean resolveSurfaceDirect(int outputMode, boolean autoEligible, boolean leanback, boolean hardDecode, boolean zeroCopyBlocked) {
+        if (!hardDecode || zeroCopyBlocked) return false;
         return switch (clamp(outputMode, OUTPUT_AUTO, OUTPUT_SURFACE_DIRECT)) {
             case OUTPUT_SURFACE_DIRECT -> true;
             case OUTPUT_GPU -> false;
@@ -97,7 +122,17 @@ public final class MpvPerformanceSetting {
     }
 
     public static String getHwdecOption() {
-        return switch (getHwdecMode()) {
+        return resolveHwdecOption(getHwdecMode(), isZeroCopyBlocked());
+    }
+
+    static String resolveHwdecOption(int mode) {
+        return resolveHwdecOption(mode, isZeroCopyBlocked());
+    }
+
+    static String resolveHwdecOption(int mode, boolean zeroCopyBlocked) {
+        int resolvedMode = clamp(mode, HWDEC_AUTO, HWDEC_COPY);
+        if (zeroCopyBlocked) return "mediacodec-copy";
+        return switch (resolvedMode) {
             case HWDEC_DIRECT -> "mediacodec";
             case HWDEC_COPY -> "mediacodec-copy";
             default -> "mediacodec,mediacodec-copy";
@@ -105,7 +140,15 @@ public final class MpvPerformanceSetting {
     }
 
     public static String getHwdecText() {
-        return switch (getHwdecMode()) {
+        return resolveHwdecText(getHwdecMode(), isZeroCopyBlocked());
+    }
+
+    static String resolveHwdecText(int mode, boolean zeroCopyBlocked) {
+        int resolvedMode = clamp(mode, HWDEC_AUTO, HWDEC_COPY);
+        if (zeroCopyBlocked) {
+            return resolvedMode == HWDEC_DIRECT ? "零拷贝（设备保护：兼容复制）" : resolvedMode == HWDEC_AUTO ? "自动（设备保护：兼容复制）" : "兼容复制";
+        }
+        return switch (resolvedMode) {
             case HWDEC_DIRECT -> "零拷贝优先";
             case HWDEC_COPY -> "兼容复制";
             default -> "自动回退";
@@ -181,7 +224,11 @@ public final class MpvPerformanceSetting {
     }
 
     public static int getFrameRateMode() {
-        return clamp(Prefers.getInt(KEY_FRAME_RATE, FRAME_RATE_SEAMLESS), FRAME_RATE_OFF, FRAME_RATE_SEAMLESS);
+        return resolveFrameRateMode(Prefers.getInt(KEY_FRAME_RATE, FRAME_RATE_SEAMLESS));
+    }
+
+    static int resolveFrameRateMode(int value) {
+        return clamp(value, FRAME_RATE_OFF, FRAME_RATE_SEAMLESS);
     }
 
     public static void putFrameRateMode(int value) {

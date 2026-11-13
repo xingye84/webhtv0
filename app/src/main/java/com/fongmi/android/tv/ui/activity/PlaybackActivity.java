@@ -6,9 +6,14 @@ import android.content.Intent;
 import android.content.ServiceConnection;
 import android.graphics.Color;
 import android.graphics.Matrix;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
+import android.text.TextUtils;
 import android.util.Log;
+import android.view.Display;
 import android.view.SurfaceView;
 import android.view.TextureView;
 import android.view.View;
@@ -20,7 +25,9 @@ import android.view.ViewConfiguration;
 
 import androidx.annotation.NonNull;
 import androidx.core.content.ContextCompat;
+import androidx.lifecycle.Lifecycle;
 import androidx.media3.common.C;
+import androidx.media3.common.MediaItem;
 import androidx.media3.common.MediaMetadata;
 import androidx.media3.common.Format;
 import androidx.media3.common.Player;
@@ -33,31 +40,48 @@ import androidx.media3.session.SessionToken;
 import androidx.media3.ui.AspectRatioFrameLayout;
 import androidx.media3.ui.PlayerView;
 
+import com.fongmi.android.tv.App;
 import com.fongmi.android.tv.R;
 import com.fongmi.android.tv.bean.History;
 import com.fongmi.android.tv.bean.Result;
+import com.fongmi.android.tv.bean.Sub;
+import com.fongmi.android.tv.bean.Vod;
+import com.fongmi.android.tv.event.RefreshEvent;
 import com.fongmi.android.tv.player.PlaybackAutoContext;
+import com.fongmi.android.tv.player.PlaybackFrameSnapshot;
+import com.fongmi.android.tv.player.PlaybackOwnershipKeys;
+import com.fongmi.android.tv.player.PlaybackServiceReleasePolicy;
 import com.fongmi.android.tv.player.PlaybackTelemetry;
 import com.fongmi.android.tv.player.PlayerManager;
+import com.fongmi.android.tv.player.VideoAspectMode;
 import com.fongmi.android.tv.player.engine.PlaySpec;
 import com.fongmi.android.tv.player.exo.ExoOutputModeManager;
 import com.fongmi.android.tv.player.exo.ExoOutputModePolicy;
 import com.fongmi.android.tv.player.exo.ExoUtil;
+import com.fongmi.android.tv.plugin.PluginHostEvents;
 import com.fongmi.android.tv.service.PlaybackService;
 import com.fongmi.android.tv.setting.PlaybackPerformanceSetting;
 import com.fongmi.android.tv.player.exo.ass.ExoAssSession;
 import com.fongmi.android.tv.player.exo.subtitle.ExoSubtitleSession;
 import com.fongmi.android.tv.setting.PlayerSetting;
+import com.fongmi.android.tv.subtitle.RealtimeSubtitleController;
 import com.fongmi.android.tv.ui.base.BaseActivity;
 import com.fongmi.android.tv.ui.dialog.DiscMenuDialog;
+import com.fongmi.android.tv.ui.dialog.VideoAspectModeDialog;
+import com.fongmi.android.tv.ui.novel.NovelRouter;
 import com.fongmi.android.tv.ui.custom.CustomSeekView;
 import com.fongmi.android.tv.utils.ResUtil;
+import com.fongmi.android.tv.utils.Task;
+import com.fongmi.android.tv.web.WebHomeInlineVodStore;
 import com.github.catvod.crawler.SpiderDebug;
 import com.google.common.util.concurrent.ListenableFuture;
+
+import java.util.function.IntConsumer;
 
 public abstract class PlaybackActivity extends BaseActivity implements MediaController.Listener, Player.Listener, ServiceConnection {
 
     private static final String SIZE_TAG = "MPV_SIZE";
+    private static final String STATE_PLAYBACK_KEY = "playback:ownershipKey";
 
     private ListenableFuture<MediaController> mControllerFuture;
     private MediaController mController;
@@ -65,21 +89,35 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
     private boolean audioOnly;
     private boolean redirect;
     private boolean playbackExiting;
+    private String preparedPlaybackKey;
+    private String pinnedPlaybackKey;
     private boolean nativeOutputPending;
     private boolean bound;
     private boolean stop;
     private boolean lock;
     private int render = -1;
-    private int requestedResizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT;
-    private int videoRotation = 0;
-    private boolean rotationEngaged = false;
-    private boolean applyingRotation = false;
+    private int videoRotation;
+    private boolean rotationEngaged;
+    private boolean applyingRotation;
     private View.OnLayoutChangeListener rotationLayoutListener;
+    private int requestedAspectMode = VideoAspectMode.ORIGINAL;
+    private boolean resizeApplied;
+    private int resizeAppliedMode;
+    private int resizeAppliedEffectiveMode;
+    private int resizeAppliedTargetAspect;
+    private int resizeAppliedContentAspect;
+    private boolean resizeAppliedStretch;
     private ExoOutputModeManager exoOutputModeManager;
     private ExoAssSession attachedAssSession;
     private ExoSubtitleSession attachedSubtitleSession;
     private final com.fongmi.android.tv.player.SurfaceDiagnosticCollector surfaceDiagnostics =
             new com.fongmi.android.tv.player.SurfaceDiagnosticCollector();
+    private static final long[] WEBHOME_SNAPSHOT_DELAYS = {2500L, 2000L, 2000L};
+    private final Handler webHomeSnapshotHandler = new Handler(Looper.getMainLooper());
+    private String webHomeSnapshotKey;
+    private int webHomeSnapshotAttempt;
+    private boolean webHomeSnapshotRunning;
+    private boolean webHomeSnapshotDone;
 
     protected MediaController controller() {
         return mController;
@@ -90,7 +128,23 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
     }
 
     protected PlayerManager player() {
-        return mService.player();
+        return mService == null ? null : mService.player();
+    }
+
+    protected boolean isServiceReady() {
+        return mService != null && mService.player() != null && !mService.player().isReleased();
+    }
+
+    protected View.OnClickListener guarded(Runnable action) {
+        return v -> {
+            if (isServiceReady()) action.run();
+        };
+    }
+
+    protected View.OnClickListener guardedView(java.util.function.Consumer<View> action) {
+        return v -> {
+            if (isServiceReady()) action.accept(v);
+        };
     }
 
     protected boolean isRedirect() {
@@ -99,7 +153,9 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
 
     protected void setRedirect(boolean redirect) {
         this.redirect = redirect;
-        if (mService != null) mService.setNavigationCallback(redirect ? null : getNavigationCallback(), getPlaybackKey());
+        if (mService == null) return;
+        if (redirect) mService.clearNavigationCallback(getNavigationCallback());
+        else mService.setNavigationCallback(getNavigationCallback(), activePlaybackKey());
     }
 
     protected boolean isPlaybackExiting() {
@@ -116,16 +172,29 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
         finish();
     }
 
+    /**
+     * 退出播放页时的确定性停播。
+     *
+     * <p>归属令牌（{@link #activePlaybackKey()}）在一次会话里可能失配：换集、onNewIntent 换条目，
+     * 或 TMDB 富集改写 intent 的 id 之后 {@link #isOwner()} 会落到 false。旧实现此时退化成
+     * {@code mController.stop()}，而控制器是异步连上的、播放又是由服务侧直接起播的，于是留下两个
+     * 漏播窗口：控制器还没连上时整次调用是空操作；播放器处于 IDLE（取流中退出）时会被会话里的
+     * stop 直接忽略。两者都不撤销前台通知，用户看到的就是「退回详情页后还有声音、通知栏还显示播放中」。
+     *
+     * <p>所以只要服务还在，退出就必须由服务自己停播：归属方关停服务，非归属方也让服务停播并撤掉
+     * 前台通知，避免退出被迟到的会话状态吞掉。控制器只保留为「服务不可用」时的兜底。
+     */
     protected void stopPlayback() {
-        if (mService != null && isOwner()) {
-            mService.shutdown();
-        } else if (mController != null) {
-            mController.stop();
+        if (mService == null) {
+            if (mController != null) mController.stop();
+            return;
         }
+        if (isOwner()) mService.shutdown();
+        else mService.suspend();
     }
 
     protected void updateNavigationKey() {
-        if (mService != null) mService.setNavigationCallback(getNavigationCallback(), getPlaybackKey());
+        if (mService != null) mService.setNavigationCallback(getNavigationCallback(), activePlaybackKey());
     }
 
     protected boolean isAudioOnly() {
@@ -160,13 +229,82 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
 
     protected abstract String getPlaybackKey();
 
+    /**
+     * Last known total duration for the current item. Engines that never publish
+     * a duration (EXO on some HLS/TS sources) leave the timeline at 0, so the
+     * seek view uses this while the engine still reports an unknown duration.
+     */
+    protected long getDurationFallbackMs() {
+        return C.TIME_UNSET;
+    }
+
     protected boolean deferPlaybackServiceBinding() {
         return false;
     }
 
+    /**
+     * 本次播放会话的归属令牌。
+     *
+     * <p>{@link #getPlaybackKey()} 由子类从 intent 现算，而 intent 的 id 会在起播之后被
+     * 详情结果改写（TMDB 富集回来的 vodId，见 VideoActivity#updateVod）。播放器里的 key 是
+     * 起播那一刻固化进 PlaySpec 的，之后无从更改；两者一旦不等，{@link #isOwner()} 便永久
+     * 为 false，于是 STATE_READY 不再下发（转圈不收）、每秒的进度采样直接返回（进度不落库、
+     * 刷新回起点）、切集也因 PlaybackService#isNavigationOwner 失配而不派发。
+     *
+     * <p>该 key 的语义是"归属与路由令牌"，必须在一次播放会话内保持稳定；History 行的 key
+     * 迁移是另一件事，二者解耦。因此起播时钉住，会话结束或换集重新起播时再更新。
+     */
+    protected final String activePlaybackKey() {
+        return pinnedPlaybackKey != null ? pinnedPlaybackKey : getPlaybackKey();
+    }
+
+    /**
+     * 丢弃上一次播放会话的归属令牌，让 {@link #activePlaybackKey()} 重新回落到 intent。
+     * 换条目（onNewIntent）时调用：此时旧会话已作废，新会话尚未起播。
+     */
+    protected final void resetPlaybackOwnership() {
+        pinnedPlaybackKey = null;
+    }
+
+    /**
+     * 本次播放会话是否由本页面拥有。
+     *
+     * <p>比较必须走 {@link PlaybackOwnershipKeys#sameSession(String, String)} 而不是字符串相等：
+     * 自动连播时服务侧用「浏览下一集」的 {@code VE:<historyKey>|<线路>|<集>} 键起播，与本页面现算的
+     * 记录键不是同一个字符串，但仍是同一次播放会话。旧实现在这里判假，导致回调里的
+     * {@code onPlayerRebuild(...)} 整段跳过、Surface 永不重绑 —— 设备日志里那次「有声音没画面、
+     * 重开才恢复」正是这条路径。
+     */
     protected boolean isOwner() {
-        String key = getPlaybackKey();
-        return key == null || (mService != null && key.equals(player().getKey()));
+        String key = activePlaybackKey();
+        PlayerManager manager = player();
+        return PlaybackOwnershipKeys.sameSession(key, manager == null ? null : manager.getKey());
+    }
+
+    public final boolean pauseForOverlayPlayback() {
+        if (!isOwner() || isFinishing() || isDestroyed()) return false;
+        PlayerManager manager = player();
+        if (manager == null || manager.isReleased() || manager.isEmpty()) return false;
+        Player active = mController != null ? mController : manager.getPlayer();
+        int state = active.getPlaybackState();
+        boolean shouldResume = active.isPlaying() || (active.getPlayWhenReady() && (state == Player.STATE_BUFFERING || state == Player.STATE_READY));
+        if (!shouldResume) return false;
+        if (mController != null) mController.pause();
+        else manager.pause();
+        syncKeepScreenOn();
+        return true;
+    }
+
+    public final void resumeAfterOverlayPlayback(boolean shouldResume) {
+        if (!shouldResume || isFinishing() || isDestroyed() || !isOwner()) return;
+        PlayerManager manager = player();
+        if (manager == null || manager.isReleased() || manager.isEmpty()) return;
+        Player active = mController != null ? mController : manager.getPlayer();
+        int state = active.getPlaybackState();
+        if (state == Player.STATE_IDLE || state == Player.STATE_ENDED || active.getPlayWhenReady()) return;
+        if (mController != null) mController.play();
+        else manager.play();
+        syncKeepScreenOn();
     }
 
     protected boolean isIdle() {
@@ -262,18 +400,70 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
     protected void onPrepare() {
     }
 
+    protected void onPlayerRebuilt() {
+    }
+
+    /**
+     * 保证「当前引擎」此刻确实挂在 PlayerView 上，必要时补一次绑定。
+     *
+     * <p>这是设备日志里那次「有声音没画面、重开才恢复」的收口点：自动连播由服务侧
+     * {@code PlaybackService#startBrowse} 用 {@code VE:} 选集键起播，页面一度判不出归属，
+     * 于是既没有重建回调去重绑，也没有其它路径补绑；解码器与音频照常工作，视频帧却全部被丢弃。
+     *
+     * <p>与 {@link #attachSurface(boolean)} 的区别：它不重设 render、不接 ASS/字幕会话，也不解绑
+     * （引擎未就绪时直接返回），只把「当前引擎」补到视图上并重放当前快门策略；绑定已正确时立刻
+     * 返回。且只在页面 RESUMED 时执行——后台的旧播放页同样会收到服务侧回调，在那里补绑会把引擎
+     * 从用户正在看的页面上抢走。
+     */
+    private void ensureVideoSurfaceBound(String reason) {
+        if (mService == null || isFinishing() || isDestroyed()) return;
+        // 只有正处在 RESUMED 的页面可能是这条会话的显示方。后台/返回栈里的旧播放页同样会收到
+        // 服务侧回调；在那里补绑会把同一个引擎从用户正在看的页面上抢走，结果还是黑屏。
+        if (!getLifecycle().getCurrentState().isAtLeast(Lifecycle.State.RESUMED)) return;
+        PlayerManager manager = player();
+        if (manager == null || manager.isReleased()) return;
+        PlayerView view = getExoView();
+        if (view == null) return;
+        Player currentPlayer = view.getPlayer();
+        Player nextPlayer = manager.getPlayer();
+        // 引擎尚未就绪时保持现状：这个兜底路径只负责「绑上当前引擎」，绝不在这里解绑。
+        if (nextPlayer == null) return;
+        VideoSurfaceBinding.Result<Player> binding = VideoSurfaceBinding.resolve(currentPlayer, nextPlayer);
+        if (!binding.applied()) return;
+        if (binding.detachedFirst()) view.setPlayer(null);
+        view.setPlayer(binding.player());
+        surfaceDiagnostics.rebind(reason, binding.detachedFirst(), view.getVideoSurfaceView());
+        logSurfaceState("ensure bound reason=" + reason);
+        syncVideoSurfaceSize(null);
+        syncShutter();
+        if (manager.isNativePlayer()) view.post(this::syncShutter);
+    }
+
+    /**
+     * The rendered frame is revealed by clearing the shutter in the caller. The
+     * loading spinner deliberately stays up until STATE_READY: a first frame does
+     * not mean playback can proceed, and hiding the spinner here would present a
+     * still-buffering session as a frozen picture. Subclasses own the spinner and
+     * clear it from their own state handling.
+     */
     protected void onExoFirstFrame() {
-        View progress = getExoView().getRootView().findViewById(R.id.progress);
-        if (progress != null) progress.setVisibility(View.GONE);
     }
 
     protected void onTracksChanged() {
     }
 
+    /**
+     * 用户选中了一个外挂字幕。有本地历史语义的子类覆写它把来源记下来，
+     * 好让下次从历史进来时自动挂回同一个字幕。
+     */
+    protected void onSubtitleSelected(Sub sub) {
+    }
+
     protected void onTitlesChanged() {
     }
 
-    protected void onPlayerRebuilt() {
+    protected boolean onSourceHttpError(int statusCode, String msg) {
+        return false;
     }
 
     protected void onControllerReady(Player controller) {
@@ -301,49 +491,139 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
     protected void onSurfaceAttached() {
     }
 
-    protected void applyResizeMode(int resizeMode) {
-        requestedResizeMode = resizeMode;
-        int effectiveResizeMode;
-        if (videoRotation != 0 && rotationEngaged && mService != null && player().isExo()) {
-            effectiveResizeMode = AspectRatioFrameLayout.RESIZE_MODE_FILL;
+    protected void onFirstFrameRendered() {
+    }
+
+    /** 子类返回当前播放历史，供 WebHome 封面截图兜底使用；没有历史时返回 null。 */
+    protected History getPlaybackHistory() {
+        return null;
+    }
+
+    private void scheduleWebHomeSnapshot() {
+        History history = getPlaybackHistory();
+        if (history == null || !WebHomeInlineVodStore.KEY.equals(history.getSiteKey())) return;
+        if (!TextUtils.isEmpty(history.getVodPic())) return;
+        if (TextUtils.equals(history.getKey(), webHomeSnapshotKey)) {
+            if (webHomeSnapshotDone || webHomeSnapshotRunning
+                    || webHomeSnapshotAttempt >= WEBHOME_SNAPSHOT_DELAYS.length) return;
         } else {
-            effectiveResizeMode = effectiveResizeMode(resizeMode);
+            webHomeSnapshotKey = history.getKey();
+            webHomeSnapshotAttempt = 0;
+            webHomeSnapshotDone = false;
         }
-        logSurfaceState("applyResizeMode before mode=" + resizeMode + " effective=" + effectiveResizeMode);
+        webHomeSnapshotHandler.removeCallbacksAndMessages(null);
+        scheduleNextWebHomeSnapshot();
+    }
+
+    private void scheduleNextWebHomeSnapshot() {
+        if (webHomeSnapshotDone || webHomeSnapshotAttempt >= WEBHOME_SNAPSHOT_DELAYS.length) return;
+        long delay = WEBHOME_SNAPSHOT_DELAYS[webHomeSnapshotAttempt++];
+        webHomeSnapshotHandler.postDelayed(this::captureWebHomeSnapshot, delay);
+    }
+
+    private void captureWebHomeSnapshot() {
+        if (webHomeSnapshotDone || webHomeSnapshotRunning || isFinishing() || isDestroyed()) return;
+        History history = getPlaybackHistory();
+        if (history == null || !WebHomeInlineVodStore.KEY.equals(history.getSiteKey())
+                || !TextUtils.isEmpty(history.getVodPic())) return;
+        final String key = history.getKey();
+        final int cid = history.getCid();
+        final String vodId = history.getVodId();
+        webHomeSnapshotRunning = true;
+        PlaybackFrameSnapshot.capture(this, getExoView(), uri -> {
+            webHomeSnapshotRunning = false;
+            if (isFinishing() || isDestroyed()) return;
+            History current = getPlaybackHistory();
+            if (current == null || !TextUtils.equals(current.getKey(), key)) return;
+            if (TextUtils.isEmpty(uri)) {
+                scheduleNextWebHomeSnapshot();
+                return;
+            }
+            webHomeSnapshotDone = true;
+            persistWebHomeSnapshot(cid, key, vodId, uri);
+        });
+    }
+
+    /**
+     * 后台落库：用原子 UPDATE 只在字段仍为空时写入，避免截图期间 TMDB 海报或播放进度被覆盖。
+     * 同时回写内嵌 VOD 存储，之后从历史详情进入也能拿到本地封面。
+     */
+    private void persistWebHomeSnapshot(int cid, String key, String vodId, String uri) {
+        Task.execute(() -> {
+            try {
+                History.updateVodPicIfEmpty(cid, key, uri);
+                WebHomeInlineVodStore.setPic(vodId, uri);
+                App.post(RefreshEvent::history);
+            } catch (Throwable ignored) {
+            }
+        });
+    }
+
+    protected void onSeekStarted() {
+    }
+
+    protected void showResizeModeDialog(int currentMode, IntConsumer action) {
+        if (action == null) return;
+        VideoAspectModeDialog.show(this, currentMode, action);
+    }
+
+    protected void applyResizeMode(int resizeMode) {
+        int mode = VideoAspectMode.sanitize(resizeMode);
+        requestedAspectMode = mode;
+        applyResizeModeNow(mode);
         PlayerView view = getExoView();
+        view.post(() -> {
+            if (requestedAspectMode == mode && !isFinishing() && !isDestroyed()) applyResizeModeNow(mode);
+        });
+    }
+
+    private void applyResizeModeNow(int resizeMode) {
+        PlayerView view = getExoView();
+        VideoAspectMode.Spec spec = VideoAspectMode.resolve(resizeMode, viewportAspectRatio(view), PlayerSetting.getCustomAspectRatio());
+        int effectiveResizeMode = videoRotation != 0 && rotationEngaged && mService != null && player().isExo()
+                ? AspectRatioFrameLayout.RESIZE_MODE_FILL : effectiveResizeMode(spec.resizeMode());
+        float contentAspectRatio = spec.hasTargetAspectRatio() ? spec.targetAspectRatio() : sourceAspectRatio();
+        if (!VideoAspectMode.isValidRatio(contentAspectRatio)) contentAspectRatio = 0f;
+        // 同一次进入播放页里，这个方法会被 onPlayerRenderRequired / onPlayerRebuild / 子类 setScale
+        // 以及 applyResizeMode 自己排的第二次 view.post 反复触发（设备实测 14-16 对）。
+        // 每一对都要拼 20+ 字段的日志、写 4 行 logcat、再 requestLayout 两次，
+        // 全都压在首帧窗口的主线程上。决策输入完全相同时直接返回。
+        // 键包含所有影响结果的量（模式/有效模式/目标比例/来源比例/stretch），
+        // 任一输入变化（视频尺寸到位、切集、切渲染、改比例）都会让键不同，仍然真实施加。
+        if (isResizeModeApplied(resizeMode, effectiveResizeMode, spec.targetAspectRatio(), contentAspectRatio, spec.stretch())) return;
+        logSurfaceState("applyResizeMode before mode=" + resizeMode + " effective=" + effectiveResizeMode + " aspect=" + spec.targetAspectRatio());
+        if (mService != null) player().setVideoAspect(spec.targetAspectRatio(), spec.stretch());
         view.setResizeMode(effectiveResizeMode);
+        AspectRatioFrameLayout content = view.findViewById(androidx.media3.ui.R.id.exo_content_frame);
+        if (content != null) content.setAspectRatio(contentAspectRatio);
         view.requestLayout();
         View surface = view.getVideoSurfaceView();
         if (surface != null) surface.requestLayout();
-        logSurfaceState("applyResizeMode after mode=" + resizeMode + " effective=" + effectiveResizeMode);
-    }
-
-    private int effectiveResizeMode(int resizeMode) {
-        if (mService != null && player().isMpv() && !player().isMpvSurfaceDirect() && resizeMode == AspectRatioFrameLayout.RESIZE_MODE_FIT) {
-            return AspectRatioFrameLayout.RESIZE_MODE_FILL;
-        }
-        return resizeMode;
+        logSurfaceState("applyResizeMode after mode=" + resizeMode + " effective=" + effectiveResizeMode + " aspect=" + contentAspectRatio);
     }
 
     protected void setVideoRotation(int rotation) {
         videoRotation = ((rotation % 360) + 360) % 360;
-        if (mService != null && player().isExo() && videoRotation != 0) {
-            rotationEngaged = true;
-        }
+        if (mService != null && player().isExo() && videoRotation != 0) rotationEngaged = true;
         if (mService != null && player().isExo() && render != getRender()) {
+            // 切渲染后 surface 异步重建，此时立即 applyVideoRotation 会落在旧 surface 上
+            //（首次旋转看似没反应、随后闪烁）。与 fish 一致：由 onSurfaceAttached/onSizeChanged
+            // 重新应用旋转与缩放，仅在 SDK<=27 时补一次重播。
             setRender();
             if (android.os.Build.VERSION.SDK_INT <= 27) getExoView().post(this::onReset);
         } else {
             applyVideoRotation();
         }
+        applyResizeMode(requestedAspectMode);
     }
 
-    protected void onReset(){}
- 
+    protected void onReset() {
+    }
+
     protected int getVideoRotation() {
         return videoRotation;
     }
- 
+
     protected void applyVideoRotation() {
         if (applyingRotation) return;
         applyingRotation = true;
@@ -353,64 +633,43 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
             applyingRotation = false;
         }
     }
- 
+
     private void applyVideoRotationInternal() {
         PlayerView view = getExoView();
         if (view == null) return;
         View surface = view.getVideoSurfaceView();
         if (surface == null) return;
-
-        View contentFrame = view.findViewById(androidx.media3.ui.R.id.exo_content_frame);
-        AspectRatioFrameLayout arFrame = contentFrame instanceof AspectRatioFrameLayout ? (AspectRatioFrameLayout) contentFrame : null;
- 
         if (videoRotation == 0) {
             surface.setRotation(0);
-            if (surface instanceof TextureView textureView) {
-                textureView.setTransform(new Matrix());
-            }
-            if (arFrame != null) {
-                arFrame.setResizeMode(effectiveResizeMode(requestedResizeMode));
-                if (mService != null && player() != null) {
-                    int vw = player().getVideoWidth();
-                    int vh = player().getVideoHeight();
-                    if (vw > 0 && vh > 0) arFrame.setAspectRatio((float) vw / vh);
-                }
-            }
+            if (surface instanceof TextureView textureView) textureView.setTransform(new Matrix());
             removeRotationLayoutListener(surface);
             return;
         }
- 
         if (!(surface instanceof TextureView textureView)) return;
         if (mService == null || player() == null) return;
         int vw = player().getVideoWidth();
         int vh = player().getVideoHeight();
         if (vw <= 0 || vh <= 0) return;
- 
-        if (arFrame != null) arFrame.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FILL);
         surface.setRotation(0);
- 
         int viewW = textureView.getWidth();
         int viewH = textureView.getHeight();
         if (viewW <= 0 || viewH <= 0) {
             ensureRotationLayoutListener(textureView);
             return;
         }
- 
         float rotatedW = (videoRotation == 90 || videoRotation == 270) ? vh : vw;
         float rotatedH = (videoRotation == 90 || videoRotation == 270) ? vw : vh;
         float fitScale = Math.min((float) viewW / rotatedW, (float) viewH / rotatedH);
         float scaleX = (vw / (float) viewW) * fitScale;
         float scaleY = (vh / (float) viewH) * fitScale;
- 
         Matrix matrix = new Matrix();
         matrix.setScale(scaleX, scaleY);
         matrix.postRotate(videoRotation, viewW * scaleX / 2f, viewH * scaleY / 2f);
         matrix.postTranslate((viewW - viewW * scaleX) / 2f, (viewH - viewH * scaleY) / 2f);
         textureView.setTransform(matrix);
- 
         ensureRotationLayoutListener(textureView);
     }
- 
+
     private void ensureRotationLayoutListener(View surface) {
         if (rotationLayoutListener == null) {
             rotationLayoutListener = (v, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) -> {
@@ -420,17 +679,76 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
         surface.removeOnLayoutChangeListener(rotationLayoutListener);
         surface.addOnLayoutChangeListener(rotationLayoutListener);
     }
- 
+
     private void removeRotationLayoutListener(View surface) {
-        if (rotationLayoutListener != null) {
-            surface.removeOnLayoutChangeListener(rotationLayoutListener);
-        }
+        if (rotationLayoutListener != null) surface.removeOnLayoutChangeListener(rotationLayoutListener);
     }
- 
+
+    private boolean isResizeModeApplied(int resizeMode, int effectiveResizeMode,
+                                        float targetAspectRatio, float contentAspectRatio, boolean stretch) {
+        int targetBits = Float.floatToIntBits(targetAspectRatio);
+        int contentBits = Float.floatToIntBits(contentAspectRatio);
+        if (resizeApplied && resizeAppliedMode == resizeMode
+                && resizeAppliedEffectiveMode == effectiveResizeMode
+                && resizeAppliedTargetAspect == targetBits
+                && resizeAppliedContentAspect == contentBits
+                && resizeAppliedStretch == stretch) {
+            return true;
+        }
+        resizeApplied = true;
+        resizeAppliedMode = resizeMode;
+        resizeAppliedEffectiveMode = effectiveResizeMode;
+        resizeAppliedTargetAspect = targetBits;
+        resizeAppliedContentAspect = contentBits;
+        resizeAppliedStretch = stretch;
+        return false;
+    }
+
+    private void invalidateAppliedResizeMode() {
+        resizeApplied = false;
+    }
+
+    private float viewportAspectRatio(PlayerView view) {
+        View container = view.getParent() instanceof View parent ? parent : view;
+        int width = container.getWidth();
+        int height = container.getHeight();
+        if (width <= 0 || height <= 0) {
+            width = getResources().getDisplayMetrics().widthPixels;
+            height = getResources().getDisplayMetrics().heightPixels;
+        }
+        return width > 0 && height > 0 ? (float) width / height : 0f;
+    }
+
+    private float sourceAspectRatio() {
+        if (mService == null || player() == null || player().getPlayer() == null) return 0f;
+        VideoSize size = player().getPlayer().getVideoSize();
+        return size.width > 0 && size.height > 0 ? size.width * size.pixelWidthHeightRatio / size.height : 0f;
+    }
+
+    private int effectiveResizeMode(int resizeMode) {
+        if (mService != null && player().isMpv() && !player().isMpvSurfaceDirect() && resizeMode == AspectRatioFrameLayout.RESIZE_MODE_FIT) {
+            return AspectRatioFrameLayout.RESIZE_MODE_FILL;
+        }
+        return resizeMode;
+    }
+
     protected void onReclaim() {
     }
 
+    protected boolean shouldBindPlaybackService() {
+        return true;
+    }
+
+    protected boolean shouldPauseOnBackground() {
+        return PlayerSetting.isBackgroundOff();
+    }
+
+    protected boolean shouldAutoPlay() {
+        return PlayerSetting.isAutoPlay();
+    }
+
     protected boolean seekTo(long deltaMs) {
+        onSeekStarted();
         long targetMs = Math.max(0, player().getPosition() + deltaMs);
         long durationMs = player().getDuration();
         boolean seekToEnd = durationMs > 0 && targetMs >= durationMs;
@@ -445,6 +763,20 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
 
     protected void startPlayer(String key, Result result, boolean useParse, long timeout,
                                MediaMetadata metadata, long startPositionMs) {
+        // 已经决定退出的播放页不能再起播。自动换源、换线路、取流结果这些链路最终都回到这里，
+        // 迟到的一次起播会在服务里正常播放并挂上前台通知，而页面已经退出，没有人再停它——
+        // 用户看到的就是「退回详情页后还有声音、通知栏还显示播放中」。
+        if (isPlaybackExiting() || isFinishing() || isDestroyed()) {
+            if (SpiderDebug.isEnabled()) SpiderDebug.log("playback-flow", "startPlayer skipped exiting=%s finishing=%s destroyed=%s key=%s", isPlaybackExiting(), isFinishing(), isDestroyed(), key);
+            return;
+        }
+        // 小说/漫画阅读器路由（播放内核前的最后一道拦截）
+        // novel:// / pics:// / manga:// 是「阅读内容协议」而非播放地址。
+        // 正常情况下 ContentDispatcher 已在更早的汇聚点分流；这里兜底处理漏网的解析结果。
+        if (NovelRouter.isReaderUrl(result)) {
+            if (NovelRouter.routeReaderEngine(this, result, key, getReaderVod())) return;
+            return;
+        }
         if (rejectUnsupportedDrm(key, result)) {
             return;
         } else if (result.getDrm() != null && !FrameworkMediaDrm.isCryptoSchemeSupported(result.getDrm().getUUID())) {
@@ -454,12 +786,26 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
         } else if (result.getRealUrl().isEmpty()) {
             onError(ResUtil.getString(R.string.error_play_url));
         } else if (result.needParse() || useParse) {
+            preparedPlaybackKey = null;
+            pinnedPlaybackKey = key;
             attachSurface();
-            player().parse(key, result, useParse, metadata, PlayerSetting.isAutoPlay(), startPositionMs);
+            player().parse(key, result, useParse, metadata, shouldAutoPlay(), startPositionMs);
         } else {
+            preparedPlaybackKey = null;
+            pinnedPlaybackKey = key;
             attachSurface();
-            player().start(PlaySpec.from(result, key, metadata, PlayerSetting.getPlayer()), timeout, PlayerSetting.isAutoPlay(), startPositionMs);
+            player().start(PlaySpec.from(result, key, metadata), timeout, shouldAutoPlay(), startPositionMs);
         }
+        syncKeepScreenOn();
+    }
+
+    /**
+     * 阅读器路由所需的当前 Vod 上下文（章节列表/书名/海报）。
+     * 子类（VideoActivity / TmdbDetailActivity）覆写以返回正在播放的 Vod；
+     * 默认 null 时阅读器仍会显示当前章内容（内联 payload），只是无章节导航。
+     */
+    protected Vod getReaderVod() {
+        return null;
     }
 
     private boolean rejectUnsupportedDrm(String key, Result result) {
@@ -470,22 +816,22 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
     }
 
     private boolean isSelectedMpvPlayer() {
-        return mService != null ? player().isMpv() : PlayerSetting.getPlayer() == PlayerSetting.MPV;
+        return mService != null ? player().isMpv() : PlayerSetting.getActivePlayer() == PlayerSetting.MPV;
     }
 
     private void bindPlaybackService() {
-        if (bound) return;
+        if (bound || shouldRejectPlaybackConnection()) return;
         long start = System.currentTimeMillis();
         if (SpiderDebug.isEnabled()) SpiderDebug.log("playback-flow", "bind service start key=%s", getPlaybackKey());
         startService(new Intent(this, PlaybackService.class));
         bindService(new Intent(this, PlaybackService.class).setAction(PlaybackService.LOCAL_BIND_ACTION), this, BIND_AUTO_CREATE);
-        buildControllerAsync();
         bound = true;
         if (SpiderDebug.isEnabled()) SpiderDebug.log("playback-flow", "bind service requested cost=%dms key=%s", System.currentTimeMillis() - start, getPlaybackKey());
     }
 
     private void bindPlaybackServiceAfterFirstFrame() {
         View root = getExoView().getRootView();
+        root.postDelayed(this::bindPlaybackServiceIfIdle, 500L);
         root.getViewTreeObserver().addOnPreDrawListener(new ViewTreeObserver.OnPreDrawListener() {
             @Override
             public boolean onPreDraw() {
@@ -498,24 +844,75 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
         });
     }
 
-    private void buildControllerAsync() {
-        long start = System.currentTimeMillis();
-        SessionToken token = new SessionToken(this, new ComponentName(this, PlaybackService.class));
-        mControllerFuture = new MediaController.Builder(this, token).setListener(this).buildAsync();
-        mControllerFuture.addListener(this::onControllerConnected, ContextCompat.getMainExecutor(this));
-        if (SpiderDebug.isEnabled()) SpiderDebug.log("playback-flow", "controller build requested cost=%dms key=%s", System.currentTimeMillis() - start, getPlaybackKey());
+    // C101: safety net for the deferred binding. If the first frame never arrives (the
+    // activity is finishing or never draws), playback must still connect instead of
+    // hanging on the loading spinner forever.
+    private void bindPlaybackServiceIfIdle() {
+        if (isFinishing() || isDestroyed() || bound) return;
+        bindPlaybackService();
     }
 
-    private void onControllerConnected() {
+    private void buildControllerAsync(SessionToken token) {
+        if (mControllerFuture != null || shouldRejectPlaybackConnection()) return;
+        if (token == null) {
+            handleControllerConnectionFailure(new IllegalStateException("Playback session token is unavailable"));
+            return;
+        }
+        long start = System.currentTimeMillis();
+        try {
+            mControllerFuture = new MediaController.Builder(this, token).setListener(this).buildAsync();
+            mControllerFuture.addListener(this::handleControllerConnected, ContextCompat.getMainExecutor(this));
+            if (SpiderDebug.isEnabled()) SpiderDebug.log("playback-flow", "controller build requested cost=%dms key=%s", System.currentTimeMillis() - start, getPlaybackKey());
+        } catch (RuntimeException e) {
+            handleControllerConnectionFailure(e);
+        }
+    }
+
+    private void handleControllerConnectionFailure(Exception e) {
+        SpiderDebug.log("playback-flow", e);
+        releaseController();
+        if (!shouldRejectPlaybackConnection()) finishPlayback();
+    }
+
+    protected void onControllerConnected() {
+    }
+
+    protected void onControllerReadyReconciled() {
+    }
+
+    private void reconcileControllerReadyState() {
+        PlayerManager manager = player();
+        if (mController == null || manager == null) return;
+        MediaItem managerItem = manager.getCurrentMediaItem();
+        MediaItem controllerItem = mController.getCurrentMediaItem();
+        String managerMediaId = managerItem == null ? null : managerItem.mediaId;
+        String controllerMediaId = controllerItem == null ? null : controllerItem.mediaId;
+        if (!PlaybackStateReconciliation.shouldReplayReady(activePlaybackKey(), preparedPlaybackKey, manager.getKey(), managerMediaId, controllerMediaId, manager.getPlaybackState(), mController.getPlaybackState())) return;
+        onControllerReadyReconciled();
+    }
+
+    private void handleControllerConnected() {
+        if (shouldRejectPlaybackConnection() || mControllerFuture == null) return;
         long start = System.currentTimeMillis();
         try {
             mController = mControllerFuture.get();
             getSeekView().setPlayer(mController);
+            getSeekView().setSeekListener(this::onSeekStarted);
+            getSeekView().setDurationFallback(this::getDurationFallbackMs);
             onControllerReady(mController);
             mController.addListener(this);
-        } catch (Exception ignored) {
+            reconcileControllerReadyState();
+        } catch (Exception e) {
+            handleControllerConnectionFailure(e);
+            return;
         }
         if (SpiderDebug.isEnabled()) SpiderDebug.log("playback-flow", "controller connected cost=%dms key=%s", System.currentTimeMillis() - start, getPlaybackKey());
+        syncKeepScreenOn();
+        if (mController != null) onControllerConnected();
+    }
+
+    private boolean shouldRejectPlaybackConnection() {
+        return playbackExiting || isFinishing() || isDestroyed();
     }
 
     private PendingIntent buildSessionIntent() {
@@ -536,24 +933,45 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
     }
 
     private void attachSurface() {
+        attachSurface(true);
+    }
+
+    private void attachSurface(boolean restoreExoShutter) {
         if (mService == null) return;
         int targetRender = getRender();
         logSurfaceState("attach start target=" + targetRender);
-        syncShutter(true);
+        if (restoreExoShutter) syncShutter(true);
+        else hideVideoShutter();
         if (render != targetRender) {
             if (SpiderDebug.isEnabled()) SpiderDebug.log("playback-flow", "switch render from=%d to=%d", render, targetRender);
             if (getExoView().getPlayer() != null) getExoView().setPlayer(null);
             getExoView().setRender(targetRender);
             render = targetRender;
-            syncShutter(true);
+            if (restoreExoShutter) syncShutter(true);
+            else hideVideoShutter();
             logSurfaceState("attach after setRender target=" + targetRender);
         }
         surfaceDiagnostics.bind(getExoView(), player().getPlaybackTraceId());
-        if (getExoView().getPlayer() == null) {
-            getExoView().setPlayer(player().getPlayer());
+        // 切集换新媒体前 PlayerManager.clear() 会把 spec 置空，preparePlayer() 再重建引擎。
+        // 此时 render 值通常不变，旧的 attachSurface 只按“PlayerView 是否为空”判断，
+        // 会把已释放的旧引擎继续留在 PlayerView 上，新引擎从未绑定 Surface。
+        // 以引擎实例身份而不是“是否为空”判断，自动下一集的黑屏路径才能强制重绑。
+        //
+        // 判定本身交给 VideoSurfaceBinding：口径是「PlayerView 上挂着的引擎实例是否就是当前引擎」，
+        // 与 Activity 是否自认归属无关。设备日志里的那次「有声音没画面」正因归属判假而漏绑。
+        Player currentPlayer = getExoView().getPlayer();
+        Player nextPlayer = player().getPlayer();
+        VideoSurfaceBinding.Result<Player> binding = VideoSurfaceBinding.resolve(currentPlayer, nextPlayer);
+        if (binding.applied()) {
+            if (binding.detachedFirst()) getExoView().setPlayer(null);
+            getExoView().setPlayer(binding.player());
+            // 换了引擎实例，PlayerView 内部状态与视频尺寸都可能变，比例必须重算一次。
+            invalidateAppliedResizeMode();
+            surfaceDiagnostics.rebind("attach", binding.detachedFirst(), getExoView().getVideoSurfaceView());
             logSurfaceState("attach after setPlayer");
             syncVideoSurfaceSize(null);
-            syncShutter();
+            if (restoreExoShutter) syncShutter();
+            else hideVideoShutter();
             if (player().isNativePlayer()) getExoView().post(this::syncShutter);
         }
         publishRenderTarget(getExoView().getVideoSurfaceView());
@@ -616,10 +1034,18 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
                 + " content=" + viewSize(content)
                 + " surface=" + surfaceName(surface) + ":" + viewSize(surface)
                 + " holder=" + surfaceHolderSize(surface)
-                + " rotation=" + (getDisplay() == null ? -1 : getDisplay().getRotation())
+                + " rotation=" + displayRotation()
                 + " orientation=" + getResources().getConfiguration().orientation;
         Log.d(SIZE_TAG, message);
         if (SpiderDebug.isEnabled()) SpiderDebug.log("surface-size", "%s", message);
+    }
+
+
+    @SuppressWarnings("deprecation")
+    private int displayRotation() {
+        Display display = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+                ? getDisplay() : getWindowManager().getDefaultDisplay();
+        return display == null ? -1 : display.getRotation();
     }
 
     private static String viewSize(View view) {
@@ -664,6 +1090,12 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
         surfaceDiagnostics.snapshot("shutter-policy");
     }
 
+    private void hideVideoShutter() {
+        View shutter = getExoView().findViewById(androidx.media3.ui.R.id.exo_shutter);
+        getExoView().setShutterBackgroundColor(Color.TRANSPARENT);
+        if (shutter != null) shutter.setVisibility(View.GONE);
+    }
+
     private void detachSurface() {
         surfaceDiagnostics.unbind();
         detachAssSurface();
@@ -687,6 +1119,21 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
         getExoView().setRender(temporaryRender);
         getExoView().setRender(targetRender);
         render = -1;
+        // 引擎换过、PlayerView 也被重置过，上一次施加的比例不再可信。
+        invalidateAppliedResizeMode();
+    }
+
+    protected void reattachVideoSurfaceAfterReparent() {
+        if (mService == null) return;
+        PlayerView view = getExoView();
+        view.setKeepContentOnPlayerReset(true);
+        hideVideoShutter();
+        detachSurface();
+        boolean posted = view.post(() -> {
+            if (mService != null && !isFinishing() && !isDestroyed()) attachSurface(false);
+            view.setKeepContentOnPlayerReset(false);
+        });
+        if (!posted) view.setKeepContentOnPlayerReset(false);
     }
 
     protected void setRender() {
@@ -709,12 +1156,17 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
 
     private void releaseService(boolean owner) {
         mService.removePlayerCallback(mPlayerCallback);
-        if (owner) mService.setNavigationCallback(null, null);
-        if (mService.hasExternalClient() || mService.hasPlayerCallback()) {
-            if (owner) mService.suspend();
-            mService.resetSessionActivity();
-        } else if (owner) {
-            mService.shutdown();
+        mService.clearNavigationCallback(getNavigationCallback());
+        boolean hasConsumer = mService.hasExternalClient() || mService.hasPlayerCallback();
+        switch (PlaybackServiceReleasePolicy.decide(owner, mService.isKeepAlive(), hasConsumer)) {
+            case RESET_SESSION -> mService.resetSessionActivity();
+            case SUSPEND_AND_RESET -> {
+                mService.suspend();
+                mService.resetSessionActivity();
+            }
+            case SHUTDOWN -> mService.shutdown();
+            case DETACH -> {
+            }
         }
     }
 
@@ -724,8 +1176,9 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
     }
 
     private void releaseController() {
-        if (mControllerFuture != null) MediaController.releaseFuture(mControllerFuture);
+        getSeekView().setPlayer(null);
         if (mController != null) mController.removeListener(this);
+        if (mControllerFuture != null) MediaController.releaseFuture(mControllerFuture);
         mControllerFuture = null;
         mController = null;
     }
@@ -735,8 +1188,27 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
         bound = false;
         if (mService != null) mService.removePlayerCallback(mPlayerCallback);
         getSeekView().setProgressPlayer(null);
+        // 页面解绑后引擎可能被别的页面接管，兜底必须跟着本页面一起撤掉，
+        // 否则别的播放会读到上一集的时长。
+        if (player() != null) player().setDurationFallback(null);
         unbindService(this);
         mService = null;
+    }
+
+    private void syncKeepScreenOn() {
+        if (shouldKeepScreenOn()) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+    }
+
+    private boolean shouldKeepScreenOn() {
+        if (!isOwner()) return false;
+        PlayerManager manager = player();
+        if (manager == null || manager.isReleased() || manager.isEmpty()) return false;
+        Player active = mController != null ? mController : manager.getPlayer();
+        int state = active.getPlaybackState();
+        if (state == Player.STATE_IDLE || state == Player.STATE_ENDED) return false;
+        if (active.isPlaying()) return true;
+        return active.getPlayWhenReady() && (state == Player.STATE_BUFFERING || state == Player.STATE_READY);
     }
 
     private String lifecycleState() {
@@ -765,7 +1237,12 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
 
         @Override
         public void onPrepare() {
-            if (isOwner()) PlaybackActivity.this.onPrepare();
+            if (isOwner()) {
+                MediaItem item = player().getCurrentMediaItem();
+                preparedPlaybackKey = item == null ? null : item.mediaId;
+                PlaybackActivity.this.onPrepare();
+                reconcileControllerReadyState();
+            }
         }
 
         @Override
@@ -776,6 +1253,11 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
         @Override
         public void onTitlesChanged() {
             if (isOwner()) PlaybackActivity.this.onTitlesChanged();
+        }
+
+        @Override
+        public boolean onSourceHttpError(int statusCode, String msg) {
+            return isOwner() && PlaybackActivity.this.onSourceHttpError(statusCode, msg);
         }
 
         @Override
@@ -795,7 +1277,7 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
             if (render == targetRender) return;
             if (SpiderDebug.isEnabled()) SpiderDebug.log("playback-flow", "LUT switch render from=%d to=%d", render, targetRender);
             setRender();
-            applyResizeMode(requestedResizeMode);
+            applyResizeMode(requestedAspectMode);
         }
 
         @Override
@@ -819,16 +1301,25 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
             if (shutter != null) shutter.setVisibility(View.INVISIBLE);
             getExoView().setShutterBackgroundColor(Color.TRANSPARENT);
             PlaybackActivity.this.onExoFirstFrame();
+            PlaybackActivity.this.onFirstFrameRendered();
+        }
+
+        @Override
+        public void onSubtitleSelected(Sub sub) {
+            if (isOwner()) PlaybackActivity.this.onSubtitleSelected(sub);
         }
 
         @Override
         public void onPlayerRebuild(Player player, boolean resetVideoSurface) {
+            // 归属必须与「当前引擎是否属于本页面」一致：AUTONEXT-02 之前这里判假的原因是
+            // 服务侧用 VE: 选集键起播而页面拿记录键比对（见 PlaybackOwnershipKeys）。判假时
+            // 整段被跳过，新引擎永远拿不到 Surface，画面全黑而声音正常。
             if (isOwner()) {
                 nativeOutputPending = player().shouldKeepVideoShutterClosed();
                 getSeekView().setProgressPlayer(player);
                 if (resetVideoSurface) resetVideoSurfaceForDecoderSwitch();
                 setRender();
-                applyResizeMode(requestedResizeMode);
+                applyResizeMode(requestedAspectMode);
                 PlaybackActivity.this.onPlayerRebuilt();
             }
         }
@@ -838,20 +1329,46 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
     protected void initView(Bundle savedInstanceState) {
         long start = System.currentTimeMillis();
         super.initView(savedInstanceState);
+        restorePlaybackKey(savedInstanceState);
+        if (!shouldBindPlaybackService()) return;
         ExoUtil.setPlayerView(getExoView());
+        RealtimeSubtitleController.get().bind(getExoView());
         exoOutputModeManager = new ExoOutputModeManager(getWindow());
         if (deferPlaybackServiceBinding()) bindPlaybackServiceAfterFirstFrame();
         else bindPlaybackService();
         if (SpiderDebug.isEnabled()) SpiderDebug.log("playback-flow", "initView cost=%dms key=%s deferred=%s", System.currentTimeMillis() - start, getPlaybackKey(), deferPlaybackServiceBinding());
     }
 
+    private void restorePlaybackKey(Bundle savedInstanceState) {
+        if (savedInstanceState == null) return;
+        String key = savedInstanceState.getString(STATE_PLAYBACK_KEY);
+        if (key != null) pinnedPlaybackKey = key;
+    }
+
+    @Override
+    protected void onSaveInstanceState(@NonNull Bundle outState) {
+        super.onSaveInstanceState(outState);
+        if (!playbackExiting && pinnedPlaybackKey != null) {
+            outState.putString(STATE_PLAYBACK_KEY, pinnedPlaybackKey);
+        }
+    }
+
     @Override
     public void onIsPlayingChanged(boolean isPlaying) {
+        syncKeepScreenOn();
+        // 埋点放在 isOwner() 早退之前：同一台设备上非 owner 的页面同样在播（服务侧起播、画中画、
+        // 多窗口），只有 owner 才广播会让订阅者以为"播放停了"。埋点只带宿主身份与本页拿到的
+        // 布尔值，不触碰视图也不再读 controller，越权观感与早退后的既有逻辑无关。
+        PluginHostEvents.playbackPlaying(this, isPlaying);
         if (!isOwner()) return;
-        if (isPlaying) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        else if (!isBuffering()) getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        syncShutter();
         if (SpiderDebug.isEnabled()) SpiderDebug.log("playback-lifecycle", "playing changed isPlaying=%s state=%d %s", isPlaying, mController == null ? -1 : mController.getPlaybackState(), lifecycleState());
         onPlayingChanged(isPlaying);
+    }
+
+    @Override
+public void onPlayWhenReadyChanged(boolean playWhenReady, int reason) {
+        syncKeepScreenOn();
     }
 
     @Override
@@ -861,14 +1378,26 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
 
     @Override
     public void onPlaybackStateChanged(int state) {
+        // 同样放在 isOwner() 早退之前：Surface 绑定那段注释已经证明状态回调对非 owner 也照常到达，
+        // 而状态机是播放器的客观事实，不随本页是否有所有权而改变。
+        PluginHostEvents.playbackState(this, state);
+        // 绑定视频 Surface 是所有权无关的必经动作：服务侧「浏览下一集」（VE: 选集键）起播时
+        // isOwner() 为假，旧实现让下面的早退把 Surface 重绑一起吞掉，新引擎于是永远拿不到
+        // Surface —— 解码器/音频正常、画面全黑，只有重开 App 才好。每次 BUFFERING/READY 都是
+        // 新媒体起播的必经点，在这里补一次「当前引擎是否已挂在视图上」的校验。
+        if (state == Player.STATE_BUFFERING || state == Player.STATE_READY) ensureVideoSurfaceBound("state=" + state);
         if (mService != null && isOwner()) surfaceDiagnostics.bind(getExoView(), player().getPlaybackTraceId());
         if (SpiderDebug.isEnabled()) SpiderDebug.log("playback-lifecycle", "state changed state=%d %s", state, lifecycleState());
-        if (isOwner()) onStateChanged(state);
+        syncKeepScreenOn();
+        if (!isOwner()) return;
+        syncShutter();
+        onStateChanged(state);
     }
 
     @Override
     public void onVideoSizeChanged(@NonNull VideoSize size) {
         if (!isOwner()) return;
+        syncShutter();
         logSurfaceState("onVideoSizeChanged size=" + size.width + "x" + size.height + " ratio=" + size.pixelWidthHeightRatio);
         publishRenderTarget(getExoView().getVideoSurfaceView());
         syncVideoSurfaceSize(size);
@@ -964,29 +1493,50 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
     }
 
     @Override
+    public void onRenderedFirstFrame() {
+        if (!isOwner()) return;
+        onFirstFrameRendered();
+        scheduleWebHomeSnapshot();
+    }
+
+    @Override
     public void onServiceConnected(ComponentName name, IBinder binder) {
+        if (shouldRejectPlaybackConnection()) return;
         long start = System.currentTimeMillis();
-        mService = ((PlaybackService.LocalBinder) binder).getService();
+        PlaybackService connectedService = ((PlaybackService.LocalBinder) binder).getService();
+        if (shouldRejectPlaybackConnection()) return;
+        mService = connectedService;
+        buildControllerAsync(mService.getSessionToken());
+        if (shouldRejectPlaybackConnection()) return;
         mService.replaceBinding(this::closePiP);
         mService.setSessionActivity(buildSessionIntent());
         mService.setPlaybackForeground(true);
-        mService.setNavigationCallback(getNavigationCallback(), getPlaybackKey());
+        mService.setNavigationCallback(getNavigationCallback(), activePlaybackKey());
         mService.addPlayerCallback(mPlayerCallback);
         getSeekView().setProgressPlayer(player().getPlayer());
+        // 引擎可能还没吐出总时长，展示层要能用本页记住的这一集时长先顶上。
+        player().setDurationFallback(this::getDurationFallbackMs);
         player().setLutAllowed(isLutAllowed());
+        syncKeepScreenOn();
         player().setDanmakuForeground(true);
         publishRenderTarget(getExoView().getVideoSurfaceView());
         applyExoOutputMode();
         if (SpiderDebug.isEnabled()) SpiderDebug.log("playback-flow", "service connected cost=%dms key=%s", System.currentTimeMillis() - start, getPlaybackKey());
         if (SpiderDebug.isEnabled()) SpiderDebug.log("playback-lifecycle", "service connected %s", lifecycleState());
+        // 放在收口内、onServiceConnected() 之前：此刻控制器、回调与 Surface 都已就位，
+        // 订阅者拿到事件就能安全地读播放器状态。
+        PluginHostEvents.playbackReady(this);
         onServiceConnected();
     }
 
     @Override
     public void onServiceDisconnected(ComponentName name) {
         if (SpiderDebug.isEnabled()) SpiderDebug.log("playback-lifecycle", "service disconnected name=%s %s", name, lifecycleState());
+        releaseController();
         getSeekView().setProgressPlayer(null);
+        if (player() != null) player().setDurationFallback(null);
         mService = null;
+        preparedPlaybackKey = null;
     }
 
     @Override
@@ -1004,6 +1554,8 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
             detachSurface();
             onReclaim();
         }
+        syncKeepScreenOn();
+        PluginHostEvents.playbackResume(this);
     }
 
     @Override
@@ -1011,6 +1563,7 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
         if (SpiderDebug.isEnabled()) SpiderDebug.log("playback-lifecycle", "activity pause %s", lifecycleState());
         super.onPause();
         if (isRedirect() && mController != null) mController.pause();
+        PluginHostEvents.playbackPause(this);
     }
 
     @Override
@@ -1022,7 +1575,7 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
         restoreExoOutputMode();
         if (SpiderDebug.isEnabled()) SpiderDebug.log("playback-lifecycle", "activity stop backgroundOff=%s %s", PlayerSetting.isBackgroundOff(), lifecycleState());
         super.onStop();
-        if (isOwner() && !isAudioOnly() && PlayerSetting.isBackgroundOff() && mController != null) mController.pause();
+        if (isOwner() && !isAudioOnly() && shouldPauseOnBackground() && mController != null) mController.pause();
     }
 
     @Override
@@ -1033,9 +1586,11 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
 
     @Override
     protected void onDestroy() {
+        webHomeSnapshotHandler.removeCallbacksAndMessages(null);
         surfaceDiagnostics.unbind();
         detachAssSurface();
         if (SpiderDebug.isEnabled()) SpiderDebug.log("playback-lifecycle", "activity destroy beforeRelease %s", lifecycleState());
+        RealtimeSubtitleController.get().unbind(getExoView());
         restoreExoOutputMode();
         super.onDestroy();
         if (isChangingConfigurations()) {

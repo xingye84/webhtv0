@@ -1,5 +1,7 @@
 package com.fongmi.android.tv.update;
 
+import com.fongmi.android.tv.utils.GithubProxy;
+
 import static org.junit.Assert.assertEquals;
 
 import java.util.List;
@@ -10,18 +12,18 @@ public class UpdateRoutePlannerTest {
 
     private final OciArtifact artifact = new OciArtifact(
             "registry-1.docker.io",
-            "llb0/webhtv-apk",
+            "fish2018/webhtv-apk",
             "v1-mobile-arm64_v8a",
             "sha256:" + "1".repeat(64),
             "sha256:" + "2".repeat(64),
             1024);
-    private final GithubProxy.Config direct = GithubProxy.resolve(GithubProxy.DIRECT, "", GithubProxy.MODE_FULL_URL);
+    private final GithubProxy.Config direct = GithubProxy.config("", GithubProxy.MODE_FULL_URL, false);
 
     @Test
     public void ociTriesOciThenGithub() {
         List<UpdateTarget> routes = UpdateRoutePlanner.plan(
                 UpdateSource.OCI,
-                "https://github.com/llb0/webhtv/releases/download/v1/app.apk",
+                "https://github.com/fish2018/webhtv/releases/download/v1/app.apk",
                 artifact,
                 direct,
                 "https://dockerproxy.net");
@@ -34,7 +36,7 @@ public class UpdateRoutePlannerTest {
     public void githubFallsBackToOci() {
         List<UpdateTarget> routes = UpdateRoutePlanner.plan(
                 UpdateSource.GITHUB,
-                "https://github.com/llb0/webhtv/releases/download/v1/app.apk",
+                "https://github.com/fish2018/webhtv/releases/download/v1/app.apk",
                 artifact,
                 direct,
                 "https://dockerproxy.net");
@@ -47,7 +49,7 @@ public class UpdateRoutePlannerTest {
     public void legacyAutoNormalizesToOci() {
         List<UpdateTarget> routes = UpdateRoutePlanner.plan(
                 "auto",
-                "https://github.com/llb0/webhtv/releases/download/v1/app.apk",
+                "https://github.com/fish2018/webhtv/releases/download/v1/app.apk",
                 artifact,
                 direct,
                 "https://dockerproxy.net");
@@ -60,7 +62,7 @@ public class UpdateRoutePlannerTest {
     public void missingOciMetadataFallsBackToGithub() {
         List<UpdateTarget> routes = UpdateRoutePlanner.plan(
                 UpdateSource.OCI,
-                "https://github.com/llb0/webhtv/releases/download/v1/app.apk",
+                "https://github.com/fish2018/webhtv/releases/download/v1/app.apk",
                 null,
                 direct,
                 "https://dockerproxy.net");

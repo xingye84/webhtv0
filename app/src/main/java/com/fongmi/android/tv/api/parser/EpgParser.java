@@ -265,8 +265,21 @@ public class EpgParser {
         return raw.trim().replaceAll("[-\\s]+", "").toUpperCase();
     }
 
-    private static File getEpgCacheDir() {
+    /** EPG 的落盘目录（内部 files/epg，不是 cacheDir）；缓存统计与清理必须用同一个目录。 */
+    public static File cacheDir() {
         return new File(Path.files(), "epg");
+    }
+
+    private static File getEpgCacheDir() {
+        return cacheDir();
+    }
+
+    public static boolean clearCache() {
+        synchronized (SYNC_LOCK) {
+            IDX_CACHE = null;
+            Path.clear(getEpgCacheDir());
+            return true;
+        }
     }
 
     private static File getDataFile() {

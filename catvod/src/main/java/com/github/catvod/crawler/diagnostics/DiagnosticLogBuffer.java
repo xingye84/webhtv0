@@ -74,6 +74,11 @@ public final class DiagnosticLogBuffer implements AutoCloseable {
 
     private record Entry(long seq, long generation, String line, int cost, boolean critical) {}
     private record ExportRequest(long generation, long target, CompletableFuture<Export> future) {}
+    /** Thread names are stable in practice; sanitising one per log line showed up in profiles. */
+    private static final ThreadLocal<String> THREAD_LABEL = ThreadLocal.withInitial(() -> {
+        String label = DiagnosticText.sanitizeTag(Thread.currentThread().getName());
+        return label.length() > 64 ? label.substring(0, 64) : label;
+    });
     private static final ThreadLocal<SimpleDateFormat> FORMAT = ThreadLocal.withInitial(() -> new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US));
     private final Object lock = new Object();
     private final Limits limits;
@@ -145,16 +150,35 @@ public final class DiagnosticLogBuffer implements AutoCloseable {
 
     public void add(String tag, String message, boolean critical) {
         if (!enabled || message == null || message.isEmpty()) return;
+        addCleaned(tag, DiagnosticText.clean(message), message, critical);
+    }
+
+    /**
+     * Producer-side entry that reuses an already-cleaned message. {@code raw} is the pre-clean text,
+     * needed only for origin suggestions.
+     */
+    public void addCleaned(String tag, DiagnosticText.Clean clean, String raw, boolean critical) {
+        if (!enabled || clean == null || clean.text().isEmpty()) return;
         long captured = clock.monotonicNanos();
         long epoch = generation();
         long sourceSeq = sourceSequence.incrementAndGet();
-        DiagnosticText.Clean clean = DiagnosticText.clean(message);
-        String safeTag = DiagnosticText.clean(tag == null ? "Debug" : tag).text().replace(':', '_').replace('[', '_').replace(']', '_');
-        if (safeTag.length() > 64) safeTag = safeTag.substring(0, 64);
-        if (safeTag.startsWith("env.native") || safeTag.startsWith("diag.session.begin")) return;
+        String safeTag = safeTag(tag);
+        if (safeTag.isEmpty()) return; // 诊断心跳/环境噪音（env.native、diag.session.begin）不入窗
+        List<String> foundOrigins = raw == null ? List.of() : DiagnosticText.origins(raw);
+        offer(safeTag, clean.text(), null, critical, false, captured, sourceSeq, clean.truncated(), foundOrigins, epoch);
+    }
+
+    private String safeTag(String tag) {
+        // sanitizeTag skips the regex engine unless the text can carry a URI or a credential, and
+        // escapes control characters either way, so it is both faster and equivalence-preserving.
+        String safe = DiagnosticText.sanitizeTag(tag == null ? "Debug" : tag);
+        safe = safe.replace(':', '_').replace('[', '_').replace(']', '_');
+        if (safe.length() > 64) safe = safe.substring(0, 64);
+        // 诊断心跳/环境噪音不进入日志窗口（与 fish 一致），避免刷屏。
+        if (safe.startsWith("env.native") || safe.startsWith("diag.session.begin")) return "";
         // Reserve the structured tag; arbitrary Spider/native text cannot impersonate events.
-        if ("av-diag".equals(safeTag)) safeTag = "legacy-av-diag";
-        offer(safeTag, clean.text(), null, critical, false, captured, sourceSeq, clean.truncated(), DiagnosticText.origins(message), epoch);
+        if ("av-diag".equals(safe)) safe = "legacy-av-diag";
+        return safe;
     }
 
     public void event(DiagnosticEvent event) {
@@ -209,8 +233,7 @@ public final class DiagnosticLogBuffer implements AutoCloseable {
     private void offer(String tag, String text, String pinKey, boolean critical, boolean structured,
                        long captured, long sourceSeq, boolean wasTruncated, List<String> foundOrigins, long epoch) {
         long wallTime = clock.wallMillis();
-        String thread = DiagnosticText.clean(Thread.currentThread().getName()).text();
-        if (thread.length() > 64) thread = thread.substring(0, 64);
+        String thread = THREAD_LABEL.get();
         String jsonThread = new JsonPrimitive(thread).toString();
         String timezone = new JsonPrimitive(TimeZone.getDefault().getID()).toString();
         int pid = clock.processId();
@@ -225,6 +248,7 @@ public final class DiagnosticLogBuffer implements AutoCloseable {
                         + ",\"pid\":" + (pid < 0 ? "null" : pid) + ",\"pidStatus\":\"" + (pid < 0 ? "not-collected" : "known")
                         + "\",\"captureGeneration\":" + generation + "}";
             }
+            else text += " [logSeq=" + seq + "]";
             String line = prefix + text;
             Entry entry = new Entry(seq, generation, line, line.getBytes(StandardCharsets.UTF_8).length + 192, critical);
             if (wasTruncated || text.contains("[truncated")) truncated++;

@@ -5,7 +5,6 @@ import android.os.Bundle;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
-import androidx.fragment.app.Fragment;
 import androidx.fragment.app.FragmentActivity;
 import androidx.viewbinding.ViewBinding;
 
@@ -18,10 +17,6 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder;
 public class SpeedDialog extends BaseAlertDialog {
 
     private DialogSpeedBinding binding;
-
-    public static void show(Fragment fragment) {
-        new SpeedDialog().show(fragment.getChildFragmentManager(), null);
-    }
 
     public static void show(FragmentActivity activity) {
         new SpeedDialog().show(activity.getSupportFragmentManager(), null);
@@ -53,7 +48,7 @@ public class SpeedDialog extends BaseAlertDialog {
 
     @Override
     protected void initEvent() {
-        binding.slider.addOnChangeListener((slider, value, fromUser) -> ((SpeedListener) requireParentFragment()).setSpeed(value));
+        binding.slider.addOnChangeListener((slider, value, fromUser) -> ((SpeedListener) requireActivity()).setSpeed(value));
         binding.slider.setOnKeyListener((view, keyCode, event) -> {
             boolean enter = KeyUtil.isEnterKey(event);
             if (enter) dismiss();

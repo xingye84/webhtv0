@@ -1,24 +1,23 @@
 <?xml version="1.0" encoding="utf-8"?>
 <HorizontalScrollView xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:app="http://schemas.android.com/apk/res-auto"
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:fillViewport="true"
     android:scrollbars="none">
 
-    <com.fongmi.android.tv.ui.custom.PlayerFocusContainer
+    <LinearLayout
         android:id="@+id/container"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:gravity="center_vertical"
-        android:orientation="horizontal"
-        app:enableCircularHorizontal="true">
+        android:orientation="horizontal">
 
         <com.google.android.material.textview.MaterialTextView
             android:id="@+id/next"
             style="@style/Control"
             android:layout_marginEnd="8dp"
+            android:nextFocusLeft="@id/repeat"
             android:text="@string/play_next" />
 
         <com.google.android.material.textview.MaterialTextView
@@ -30,8 +29,10 @@
         <com.google.android.material.textview.MaterialTextView
             android:id="@+id/episodes"
             style="@style/Control"
-            android:layout_marginEnd="8dp"
-            android:text="@string/play_episodes" />
+            android:layout_marginEnd="12dp"
+            android:text="@string/play_episodes"
+            android:visibility="gone"
+            tools:visibility="visible" />
 
         <com.google.android.material.textview.MaterialTextView
             android:id="@+id/discMenu"
@@ -48,10 +49,17 @@
             android:text="@string/play_reset" />
 
         <com.google.android.material.textview.MaterialTextView
+            android:id="@+id/search"
+            style="@style/Control"
+            android:layout_marginEnd="8dp"
+            android:text="@string/play_search" />
+
+        <com.google.android.material.textview.MaterialTextView
             android:id="@+id/change2"
             style="@style/Control"
             android:layout_marginEnd="8dp"
-            android:text="@string/play_change" />
+            android:text="@string/play_change"
+            android:visibility="gone" />
 
         <com.google.android.material.textview.MaterialTextView
             android:id="@+id/fullscreen"
@@ -76,13 +84,20 @@
             style="@style/Control"
             android:layout_marginEnd="8dp"
             android:text="@string/play_params" />
+        <com.google.android.material.textview.MaterialTextView
+            android:id="@+id/multiThreadProxy"
+            style="@style/Control"
+            android:layout_marginEnd="8dp"
+            android:text="@string/multi_thread_proxy_button" />
 
         <com.google.android.material.textview.MaterialTextView
             android:id="@+id/panDiagnostic"
             style="@style/Control"
             android:layout_marginEnd="8dp"
             android:contentDescription="@string/pan_diagnostic_title"
-            android:text="@string/pan_diagnostic_entry" />
+            android:text="@string/pan_diagnostic_entry"
+            android:visibility="gone"
+            tools:visibility="visible" />
 
         <com.google.android.material.textview.MaterialTextView
             android:id="@+id/codecCapability"
@@ -107,8 +122,15 @@
             android:id="@+id/rotate"
             style="@style/Control"
             android:layout_marginEnd="8dp"
-            android:fontFeatureSettings="tnum"
             android:text="@string/play_rotate" />
+
+        <com.google.android.material.textview.MaterialTextView
+            android:id="@+id/actionQuality"
+            style="@style/Control"
+            android:layout_marginEnd="12dp"
+            android:text="@string/detail_quality"
+            android:visibility="gone"
+            tools:visibility="visible" />
 
         <com.google.android.material.textview.MaterialTextView
             android:id="@+id/lut"
@@ -163,23 +185,19 @@
             android:layout_marginEnd="8dp"
             android:text="@string/play_ed" />
 
-        <com.fongmi.android.tv.ui.custom.CustomUpDownView
-            android:id="@+id/sub_head"
-            style="@style/Control"
-            android:layout_marginEnd="8dp"
-            android:text="@string/play_sub_head" />
-
-        <com.fongmi.android.tv.ui.custom.CustomUpDownView
-            android:id="@+id/sub_tail"
-            style="@style/Control"
-            android:layout_marginEnd="8dp"
-            android:text="@string/play_sub_tail" />
-
         <com.google.android.material.textview.MaterialTextView
             android:id="@+id/danmaku"
             style="@style/Control"
             android:layout_marginEnd="8dp"
             android:text="@string/danmaku"
+            android:visibility="gone"
+            tools:visibility="visible" />
+
+        <com.google.android.material.textview.MaterialTextView
+            android:id="@+id/adFeedback"
+            style="@style/Control"
+            android:layout_marginEnd="8dp"
+            android:text="@string/play_ad_feedback"
             android:visibility="gone"
             tools:visibility="visible" />
 
@@ -192,16 +210,10 @@
             tools:visibility="visible" />
 
         <com.google.android.material.textview.MaterialTextView
-            android:id="@+id/setting"
-            style="@style/Control"
-            android:layout_marginEnd="8dp"
-            android:text="@string/play_setting" />
-
-        <com.google.android.material.textview.MaterialTextView
             android:id="@+id/cast"
             style="@style/Control"
             android:layout_marginEnd="8dp"
-            android:text="@string/push" />
+            android:text="@string/play_cast" />
 
         <com.google.android.material.textview.MaterialTextView
             android:id="@+id/timer"
@@ -212,9 +224,13 @@
         <com.google.android.material.textview.MaterialTextView
             android:id="@+id/repeat"
             style="@style/Control"
-            android:layout_marginEnd="8dp"
+            android:nextFocusRight="@id/next"
             android:text="@string/play_repeat" />
 
-    </com.fongmi.android.tv.ui.custom.PlayerFocusContainer>
+        <com.google.android.material.textview.MaterialTextView
+            android:id="@+id/setting"
+            style="@style/Control"
+            android:text="@string/play_setting" />
 
+    </LinearLayout>
 </HorizontalScrollView>

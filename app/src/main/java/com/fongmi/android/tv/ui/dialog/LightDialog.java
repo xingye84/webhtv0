@@ -4,6 +4,8 @@ import android.app.Dialog;
 import android.content.Context;
 import android.graphics.Color;
 import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.Drawable;
+import android.graphics.drawable.InsetDrawable;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
@@ -11,12 +13,17 @@ import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowManager;
 import android.widget.LinearLayout;
-import android.widget.ScrollView;
+import android.widget.ListAdapter;
+import android.widget.ListView;
 
+import androidx.appcompat.app.AlertDialog;
 import androidx.core.content.ContextCompat;
 import androidx.core.widget.TextViewCompat;
 
 import com.fongmi.android.tv.R;
+import com.fongmi.android.tv.theme.ThemeController;
+import com.fongmi.android.tv.theme.ThemeEditorUi;
+import com.fongmi.android.tv.ui.helper.TouchOptimizationHelper;
 import com.fongmi.android.tv.utils.ResUtil;
 import com.fongmi.android.tv.utils.Util;
 import com.google.android.material.button.MaterialButton;
@@ -27,12 +34,105 @@ public final class LightDialog {
     private LightDialog() {
     }
 
+    public static void apply(AlertDialog dialog) {
+        if (dialog == null) return;
+        Window window = dialog.getWindow();
+        if (window == null) return;
+        TouchOptimizationHelper.sync(dialog);
+        // The shell keeps the opaque semantic fill on purpose: dialogOpacity is applied by
+        // bindWindowBackground below, which is the one documented owner of that slot. Baking
+        // the alpha in here scaled it twice (0.70 -> 0.49) and, because a translucent fill no
+        // longer matches its baseline role, also stopped the shell from following a user
+        // surfaceContainerHigh override.
+        Drawable background = shell(dialog.getContext());
+        int verticalInset = (int) (dialog.getContext().getResources().getDisplayMetrics().density * 24);
+        window.setBackgroundDrawable(new InsetDrawable(background, 0, verticalInset, 0, verticalInset));
+        if (Util.isLeanback()) applyAlertWindow(dialog, window);
+        // AlertController installs the message and button views during show(), so the
+        // binder root is registered here and re-walked by descendant-count changes.
+        ThemeController.bindDialog(dialog);
+        ThemeController.bindWindowBackground(background);
+    }
+
+    /**
+     * The one dialog shell shape, shared by the AlertDialog and the custom-Dialog paths.
+     *
+     * <p>Public so a test can assert the two halves of the shell contract on the real
+     * drawable: it ships opaque (so {@code dialogOpacity} has a single owner), and its fill
+     * is the semantic {@code colorSurfaceContainerHigh} value (so the binder's exact-match
+     * rewrite can still find the role).
+     */
+    public static Drawable shell(Context context) {
+        return ThemeEditorUi.shape(context, ThemeController.current().colorSurfaceContainerHigh(), 0, 0, 22);
+    }
+
+    static int resolveAlertWidth(int screenWidth, int screenHeight) {
+        boolean landscape = screenWidth >= screenHeight;
+        float widthFactor = landscape ? 0.52f : 0.9f;
+        int designWidth = landscape ? 960 : 540;
+        int designHeight = landscape ? 540 : 960;
+        float scale = Math.min(screenWidth / (float) designWidth, screenHeight / (float) designHeight);
+        return Math.min(Math.round(screenWidth * widthFactor), Math.round(560 * scale));
+    }
+
+    static int resolveAlertListMaxHeight(int screenHeight) {
+        return Math.round(screenHeight * 0.58f);
+    }
+
+    static int resolveAlertWindowMaxHeight(int screenHeight) {
+        return Math.round(screenHeight * 0.82f);
+    }
+
+    static int resolveAlertWindowHeight(int currentHeight, int currentListHeight, int desiredListHeight, int maxHeight) {
+        return Math.min(maxHeight, currentHeight - currentListHeight + desiredListHeight);
+    }
+
+    private static void applyAlertWindow(AlertDialog dialog, Window window) {
+        Context context = dialog.getContext();
+        int screenWidth = ResUtil.getScreenWidth(context);
+        int screenHeight = ResUtil.getScreenHeight(context);
+        int width = resolveAlertWidth(screenWidth, screenHeight);
+        window.setLayout(width, WindowManager.LayoutParams.WRAP_CONTENT);
+        ListView list = dialog.getListView();
+        if (list == null) return;
+        int listMaxHeight = resolveAlertListMaxHeight(screenHeight);
+        int windowMaxHeight = resolveAlertWindowMaxHeight(screenHeight);
+        list.post(() -> resizeAlertList(dialog, window, list, width, listMaxHeight, windowMaxHeight));
+    }
+
+    private static void resizeAlertList(AlertDialog dialog, Window window, ListView list, int windowWidth, int listMaxHeight, int windowMaxHeight) {
+        if (!dialog.isShowing()) return;
+        ListAdapter adapter = list.getAdapter();
+        if (adapter == null || adapter.getCount() == 0) return;
+        int widthSpec = View.MeasureSpec.makeMeasureSpec(windowWidth, View.MeasureSpec.AT_MOST);
+        int contentHeight = list.getListPaddingTop() + list.getListPaddingBottom();
+        int measuredItems = 0;
+        while (measuredItems < adapter.getCount() && contentHeight < listMaxHeight) {
+            View item = adapter.getView(measuredItems, null, list);
+            item.measure(widthSpec, View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
+            contentHeight += item.getMeasuredHeight();
+            measuredItems++;
+        }
+        contentHeight += Math.max(0, measuredItems - 1) * list.getDividerHeight();
+        if (measuredItems < adapter.getCount()) contentHeight = listMaxHeight;
+        int listHeight = Math.min(contentHeight, listMaxHeight);
+        int windowHeight = resolveAlertWindowHeight(window.getDecorView().getHeight(), list.getHeight(), listHeight, windowMaxHeight);
+        ViewGroup.LayoutParams params = list.getLayoutParams();
+        params.height = listHeight;
+        list.setLayoutParams(params);
+        window.setLayout(windowWidth, windowHeight);
+    }
+
     public static Dialog create(Context context, CharSequence title, View content) {
         return create(context, title, content, null, null, null, null);
     }
 
     public static Dialog create(Context context, CharSequence title, View content, float landFactor, float portFactor, int maxDp) {
-        return createInternal(context, title, content, null, null, null, null, null, null, landFactor, portFactor, maxDp);
+        return createInternal(context, title, content, null, null, null, null, null, null, landFactor, portFactor, maxDp, WindowManager.LayoutParams.WRAP_CONTENT);
+    }
+
+    public static Dialog create(Context context, CharSequence title, View content, float landFactor, float portFactor, int maxDp, int heightPx) {
+        return createInternal(context, title, content, null, null, null, null, null, null, landFactor, portFactor, maxDp, heightPx);
     }
 
     public static Dialog create(Context context, CharSequence title, View content, String positive, View.OnClickListener onPositive, String negative, View.OnClickListener onNegative) {
@@ -40,15 +140,19 @@ public final class LightDialog {
     }
 
     public static Dialog create(Context context, CharSequence title, View content, String positive, View.OnClickListener onPositive, String negative, View.OnClickListener onNegative, String neutral, View.OnClickListener onNeutral) {
-        return createInternal(context, title, content, positive, onPositive, negative, onNegative, neutral, onNeutral, 0.52f, 0.9f, 560);
+        return createInternal(context, title, content, positive, onPositive, negative, onNegative, neutral, onNeutral, 0.52f, 0.9f, 560, WindowManager.LayoutParams.WRAP_CONTENT);
     }
 
-    private static Dialog createInternal(Context context, CharSequence title, View content, String positive, View.OnClickListener onPositive, String negative, View.OnClickListener onNegative, String neutral, View.OnClickListener onNeutral, float landFactor, float portFactor, int maxDp) {
+    private static Dialog createInternal(Context context, CharSequence title, View content, String positive, View.OnClickListener onPositive, String negative, View.OnClickListener onNegative, String neutral, View.OnClickListener onNeutral, float landFactor, float portFactor, int maxDp, int heightPx) {
         Dialog dialog = new Dialog(context);
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
-        dialog.setContentView(root(context, title, content, positive, listener(dialog, onPositive), negative, listener(dialog, onNegative), neutral, listener(dialog, onNeutral)));
+        dialog.setContentView(root(context, title, content, positive, listener(dialog, onPositive), negative, listener(dialog, onNegative), neutral, listener(dialog, onNeutral), heightPx > 0));
         dialog.setCanceledOnTouchOutside(true);
-        dialog.setOnShowListener(d -> applyWindow(dialog, context, landFactor, portFactor, maxDp));
+        dialog.setOnShowListener(d -> {
+            applyWindow(dialog, context, landFactor, portFactor, maxDp, heightPx);
+            TouchOptimizationHelper.sync(dialog);
+            ThemeController.bindDialog(dialog);
+        });
         return dialog;
     }
 
@@ -59,10 +163,10 @@ public final class LightDialog {
         };
     }
 
-    private static View root(Context context, CharSequence title, View content, String positive, View.OnClickListener onPositive, String negative, View.OnClickListener onNegative, String neutral, View.OnClickListener onNeutral) {
+    private static View root(Context context, CharSequence title, View content, String positive, View.OnClickListener onPositive, String negative, View.OnClickListener onNegative, String neutral, View.OnClickListener onNeutral, boolean fillHeight) {
         LinearLayout root = new LinearLayout(context);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundResource(R.drawable.shape_shell_proxy_dialog);
+        root.setBackground(shell(context));
         int actionCount = (positive == null ? 0 : 1) + (negative == null ? 0 : 1) + (neutral == null ? 0 : 1);
         int vertical = ResUtil.dp2px(24);
         int horizontal = ResUtil.dp2px(actionCount >= 3 ? 18 : 24);
@@ -71,20 +175,15 @@ public final class LightDialog {
         if (title != null) {
             MaterialTextView titleView = new MaterialTextView(context);
             titleView.setText(title);
-            titleView.setTextColor(Color.parseColor("#202124"));
+            titleView.setTextColor(ThemeController.current().colorOnSurface());
             titleView.setTextSize(18);
             titleView.setGravity(Gravity.CENTER_VERTICAL);
             root.addView(titleView, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         }
 
         if (content != null) {
-            LinearLayout.LayoutParams contentParams;
-            if (content instanceof ScrollView) {
-                contentParams = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0);
-                contentParams.weight = 1f;
-            } else {
-                contentParams = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            }
+            LinearLayout.LayoutParams contentParams = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, fillHeight ? 0 : ViewGroup.LayoutParams.WRAP_CONTENT);
+            if (fillHeight) contentParams.weight = 1.0f;
             contentParams.topMargin = title == null ? 0 : ResUtil.dp2px(16);
             root.addView(content, contentParams);
         }
@@ -143,29 +242,18 @@ public final class LightDialog {
         return button;
     }
 
-    private static void applyWindow(Dialog dialog, Context context, float landFactor, float portFactor, int maxDp) {
+    private static void applyWindow(Dialog dialog, Context context, float landFactor, float portFactor, int maxDp, int heightPx) {
         Window window = dialog.getWindow();
         if (window == null) return;
         WindowManager.LayoutParams params = window.getAttributes();
         boolean land = ResUtil.isLand(context);
         params.width = Math.min(Math.round(ResUtil.getScreenWidth(context) * (land ? landFactor : portFactor)), ResUtil.dp2px(maxDp));
-        params.height = hasScrollContent(window) ? Math.round(ResUtil.getScreenHeight(context) * 0.85f) : WindowManager.LayoutParams.WRAP_CONTENT;
+        params.height = heightPx > 0 ? heightPx : WindowManager.LayoutParams.WRAP_CONTENT;
         params.dimAmount = 0.58f;
         window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
         window.getDecorView().setPadding(0, 0, 0, 0);
         window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
         window.setAttributes(params);
         window.setLayout(params.width, params.height);
-    }
-
-    private static boolean hasScrollContent(Window window) {
-        View contentParent = window.getDecorView().findViewById(android.R.id.content);
-        if (!(contentParent instanceof ViewGroup)) return false;
-        View root = ((ViewGroup) contentParent).getChildAt(0);
-        if (!(root instanceof ViewGroup)) return false;
-        for (int i = 0; i < ((ViewGroup) root).getChildCount(); i++) {
-            if (((ViewGroup) root).getChildAt(i) instanceof ScrollView) return true;
-        }
-        return false;
     }
 }

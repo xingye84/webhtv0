@@ -19,17 +19,17 @@ import com.fongmi.android.tv.bean.Live;
 import com.fongmi.android.tv.bean.Site;
 import com.fongmi.android.tv.databinding.ActivitySettingBinding;
 import com.fongmi.android.tv.db.AppDatabase;
+import com.fongmi.android.tv.setting.ConfigSyncPolicy;
 import com.fongmi.android.tv.event.ConfigEvent;
 import com.fongmi.android.tv.event.RefreshEvent;
 import com.fongmi.android.tv.impl.Callback;
 import com.fongmi.android.tv.impl.ConfigListener;
 import com.fongmi.android.tv.impl.LiveListener;
 import com.fongmi.android.tv.impl.SiteListener;
-import com.fongmi.android.tv.setting.PlayerSetting;
 import com.fongmi.android.tv.setting.Setting;
 import com.fongmi.android.tv.ui.base.BaseActivity;
 import com.fongmi.android.tv.ui.dialog.AboutDialog;
-import com.fongmi.android.tv.ui.dialog.ConfigDialog;
+import com.fongmi.android.tv.ui.dialog.AppearanceDialog;
 import com.fongmi.android.tv.ui.dialog.DohDialog;
 import com.fongmi.android.tv.ui.dialog.HistoryDialog;
 import com.fongmi.android.tv.ui.dialog.LiveDialog;
@@ -37,6 +37,9 @@ import com.fongmi.android.tv.ui.dialog.RestoreDialog;
 import com.fongmi.android.tv.ui.dialog.BackupProgressDialog;
 import com.fongmi.android.tv.ui.dialog.SiteDialog;
 import com.fongmi.android.tv.utils.AppVersion;
+import com.fongmi.android.tv.cache.CacheCenter;
+import com.fongmi.android.tv.cache.CachePolicyStore;
+import com.fongmi.android.tv.ui.dialog.CacheManagementDialog;
 import com.fongmi.android.tv.utils.FileUtil;
 import com.fongmi.android.tv.utils.FocusLoop;
 import com.fongmi.android.tv.utils.KeyUtil;
@@ -54,24 +57,26 @@ import java.util.List;
 
 public class SettingActivity extends BaseActivity implements ConfigListener, SiteListener, LiveListener, DohDialog.Listener {
 
-    private ActivitySettingBinding mBinding;
-    private String[] size;
-    private String[] language;
-    private String[] titleLines;
-    private String[] defaultLaunch;
-    private String[] uiScale;
-    private static final int[] UI_SCALE_VALUES = {Setting.UI_SCALE_WIDE_COMFORT, Setting.UI_SCALE_FOLLOW_SYSTEM, Setting.UI_SCALE_STANDARD, Setting.UI_SCALE_COMPACT};
-
+    /**
+     * 设置页的焦点网格：一行一个数组，顺序与 activity_setting.xml 的分组顺序一致。
+     * 上下左右都按这张表环形跳转，跨组时不会掉进死胡同。
+     */
     private static final int[][] FOCUS_GRID = {
-        {R.id.vod, R.id.vodHome, R.id.vodHistory},
-        {R.id.live, R.id.liveHome, R.id.liveHistory},
-        {R.id.wall, R.id.wallDefault, R.id.wallRefresh},
-        {R.id.enhance, R.id.player, R.id.danmaku},
-        {R.id.defaultLaunch, R.id.language, R.id.titleLines},
-        {R.id.incognito, R.id.doh, R.id.size},
-        {R.id.backup, R.id.restore, R.id.uiScale},
-        {R.id.autoClearCache, R.id.cache, R.id.version}
+            {R.id.vod, R.id.vodHome, R.id.vodHistory},
+            {R.id.live, R.id.liveHome, R.id.liveHistory},
+            {R.id.wall, R.id.wallDefault, R.id.wallRefresh},
+            {R.id.enhance, R.id.player, R.id.danmaku},
+            {R.id.ad},
+            {R.id.subtitle, R.id.defaultLaunch},
+            {R.id.tmdb, R.id.ai},
+            {R.id.appearance, R.id.personal},
+            {R.id.incognito, R.id.doh},
+            {R.id.backup, R.id.restore},
+            {R.id.cache, R.id.version}
     };
+
+    private ActivitySettingBinding mBinding;
+    private String[] defaultLaunch;
 
     public static void start(Activity activity) {
         activity.startActivity(new Intent(activity, SettingActivity.class));
@@ -110,19 +115,27 @@ public class SettingActivity extends BaseActivity implements ConfigListener, Sit
     private void setOtherText() {
         mBinding.dohText.setText(getDohList()[getDohIndex()]);
         mBinding.incognitoText.setText(getSwitch(Setting.isIncognito()));
-        mBinding.autoClearCacheText.setText(getSwitch(Setting.isAutoClearCache()));
-        mBinding.languageText.setText((language = ResUtil.getStringArray(R.array.select_language))[Setting.getLanguageIndex()]);
-        mBinding.sizeText.setText((size = ResUtil.getStringArray(R.array.select_size))[PlayerSetting.getSize()]);
-        mBinding.uiScaleText.setText((uiScale = new String[]{"特宽松", "宽松", "标准", "紧凑"})[getUiScaleIndex()]);
-        mBinding.titleLinesText.setText((titleLines = ResUtil.getStringArray(R.array.select_title_lines))[Setting.getTitleLinesIndex()]);
         mBinding.defaultLaunchText.setText((defaultLaunch = ResUtil.getStringArray(R.array.select_default_launch))[Setting.getDefaultLaunch()]);
     }
 
     private void setCacheText() {
-        FileUtil.getCacheSize(new Callback() {
-            @Override
-            public void success(String result) {
-                mBinding.cacheText.setText(result);
+        if (!CachePolicyStore.isManagementEnabled()) {
+            FileUtil.getCacheSize(new Callback() {
+                @Override
+                public void success(String result) {
+                    if (mBinding != null) mBinding.cacheText.setText(result);
+                }
+            });
+            return;
+        }
+        mBinding.cacheText.setText(R.string.cache_management_scanning);
+        CacheCenter.get().requestSnapshot(false, snapshot -> {
+            if (mBinding != null && !isFinishing() && !isDestroyed()) {
+                String total = FileUtil.byteCountToDisplaySize(snapshot.totalBytes());
+                long quota = snapshot.systemQuotaBytes();
+                mBinding.cacheText.setText(quota > 0
+                        ? getString(R.string.cache_management_inline, total, FileUtil.byteCountToDisplaySize(quota))
+                        : total);
             }
         });
     }
@@ -133,25 +146,27 @@ public class SettingActivity extends BaseActivity implements ConfigListener, Sit
         mBinding.doh.setOnClickListener(this::setDoh);
         mBinding.live.setOnClickListener(this::onLive);
         mBinding.wall.setOnClickListener(this::onWall);
-        mBinding.size.setOnClickListener(this::setSize);
-        mBinding.uiScale.setOnClickListener(this::setUiScale);
-        mBinding.language.setOnClickListener(this::setLanguage);
-        mBinding.defaultLaunch.setOnClickListener(this::setDefaultLaunch);
-        mBinding.titleLines.setOnClickListener(this::setTitleLines);
-        mBinding.autoClearCache.setOnClickListener(this::setAutoClearCache);
-        mBinding.cache.setOnClickListener(this::onCache);
+        mBinding.cache.setOnClickListener(this::onCacheClear);
+        // The plain click restores the pre-split one-key clear; the panel moved to the long press.
+        // The row stays single-line by user request, so §15.2's "not long-press only" intent is a
+        // recorded deviation rather than a printed hint (docs/CACHE-MGMT-01-cache-management-design.md).
+        mBinding.cache.setOnLongClickListener(this::onCacheManage);
         mBinding.backup.setOnClickListener(this::onBackup);
         mBinding.enhance.setOnClickListener(this::onEnhance);
+        mBinding.tmdb.setOnClickListener(this::onTmdb);
+        mBinding.ai.setOnClickListener(this::onAi);
+        mBinding.ad.setOnClickListener(this::onAd);
         mBinding.player.setOnClickListener(this::onPlayer);
         mBinding.danmaku.setOnClickListener(this::onDanmaku);
+        mBinding.subtitle.setOnClickListener(this::onSubtitle);
+        mBinding.appearance.setOnClickListener(this::onAppearance);
+        mBinding.personal.setOnClickListener(this::onPersonal);
         mBinding.restore.setOnClickListener(this::onRestore);
         mBinding.version.setOnClickListener(this::onVersion);
-        mBinding.vod.setOnLongClickListener(this::onVodEdit);
         mBinding.vodHome.setOnClickListener(this::onVodHome);
-        mBinding.live.setOnLongClickListener(this::onLiveEdit);
         mBinding.liveHome.setOnClickListener(this::onLiveHome);
-        mBinding.wall.setOnLongClickListener(this::onWallEdit);
         mBinding.incognito.setOnClickListener(this::setIncognito);
+        mBinding.defaultLaunch.setOnClickListener(this::setDefaultLaunch);
         mBinding.vodHistory.setOnClickListener(this::onVodHistory);
         mBinding.liveHistory.setOnClickListener(this::onLiveHistory);
         mBinding.wallDefault.setOnClickListener(this::setWallDefault);
@@ -173,7 +188,12 @@ public class SettingActivity extends BaseActivity implements ConfigListener, Sit
     private void load(Config config) {
         switch (config.getType()) {
             case 0:
+                String previousVodUrl = VodConfig.getUrl();
                 VodConfig.load(config, getCallback());
+                if (ConfigSyncPolicy.shouldSyncLive(previousVodUrl, LiveConfig.getUrl())) {
+                    Config liveConfig = AppDatabase.get().getConfigDao().find(config.getUrl(), 1);
+                    if (liveConfig != null) LiveConfig.load(liveConfig, new Callback());
+                }
                 break;
             case 1:
                 LiveConfig.load(config, getCallback());
@@ -217,30 +237,15 @@ public class SettingActivity extends BaseActivity implements ConfigListener, Sit
     }
 
     private void onVod(View view) {
-        ConfigDialog.create().vod().show(this);
+        HistoryDialog.create().vod().manage().show(this);
     }
 
     private void onLive(View view) {
-        ConfigDialog.create().live().show(this);
+        HistoryDialog.create().live().manage().show(this);
     }
 
     private void onWall(View view) {
-        ConfigDialog.create().wall().show(this);
-    }
-
-    private boolean onVodEdit(View view) {
-        ConfigDialog.create().vod().edit().show(this);
-        return true;
-    }
-
-    private boolean onLiveEdit(View view) {
-        ConfigDialog.create().live().edit().show(this);
-        return true;
-    }
-
-    private boolean onWallEdit(View view) {
-        ConfigDialog.create().wall().edit().show(this);
-        return true;
+        HistoryDialog.create().wall().manage().show(this);
     }
 
     private void onVodHome(View view) {
@@ -267,12 +272,50 @@ public class SettingActivity extends BaseActivity implements ConfigListener, Sit
         SettingEnhanceActivity.start(this);
     }
 
+    private void onTmdb(View view) {
+        SettingTmdbActivity.start(this);
+    }
+
+    private void onAi(View view) {
+        SettingAiActivity.start(this);
+    }
+
+    private void onAd(View view) {
+        SettingAdActivity.start(this);
+    }
+
     private void onDanmaku(View view) {
         SettingDanmakuActivity.start(this);
     }
 
+    private void onSubtitle(View view) {
+        SettingSubtitleActivity.start(this);
+    }
+
+    private void onAppearance(View view) {
+        AppearanceDialog.show(this);
+    }
+
+    private void onPersonal(View view) {
+        SettingPersonalActivity.start(this);
+    }
+
     private void onVersion(View view) {
         AboutDialog.show(this, () -> Updater.create().force().start(this));
+    }
+
+    /**
+     * 菜单键等于「关于」里那颗检查更新按钮：不进弹窗，直接走同一套强制检查更新流程。
+     * 方向键在整页范围内按 {@link #FOCUS_GRID} 环形跳转，到边不再卡住。
+     */
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        if (event.getKeyCode() == KeyEvent.KEYCODE_MENU) {
+            if (KeyUtil.isActionUp(event)) Updater.create().force().start(this);
+            return true;
+        }
+        if (FocusLoop.handle(this, FOCUS_GRID, FocusLoop.Mode.BOTH, event)) return true;
+        return super.dispatchKeyEvent(event);
     }
 
     private void setWallDefault(View view) {
@@ -297,39 +340,6 @@ public class SettingActivity extends BaseActivity implements ConfigListener, Sit
         mBinding.incognitoText.setText(getSwitch(Setting.isIncognito()));
     }
 
-    private void setSize(View view) {
-        int index = (PlayerSetting.getSize() + 1) % size.length;
-        mBinding.sizeText.setText(size[index]);
-        PlayerSetting.putSize(index);
-        RefreshEvent.size();
-    }
-
-    private int getUiScaleIndex() {
-        int scale = Setting.getUiScale();
-        for (int i = 0; i < UI_SCALE_VALUES.length; i++) if (UI_SCALE_VALUES[i] == scale) return i;
-        return 0;
-    }
-
-    private void setUiScale(View view) {
-        int index = (getUiScaleIndex() + 1) % uiScale.length;
-        mBinding.uiScaleText.setText(uiScale[index]);
-        Setting.putUiScale(UI_SCALE_VALUES[index]);
-        recreate();
-    }
-
-    private void setLanguage(View view) {
-        int index = (Setting.getLanguageIndex() + 1) % language.length;
-        Setting.putLanguageIndex(index);
-        RefreshEvent.language();
-    }
-
-    private void setTitleLines(View view) {
-        int index = (Setting.getTitleLinesIndex() + 1) % titleLines.length;
-        mBinding.titleLinesText.setText(titleLines[index]);
-        Setting.putTitleLinesIndex(index);
-        RefreshEvent.size();
-    }
-
     private void setDefaultLaunch(View view) {
         int index = (Setting.getDefaultLaunch() + 1) % defaultLaunch.length;
         Setting.putDefaultLaunch(index);
@@ -347,52 +357,89 @@ public class SettingActivity extends BaseActivity implements ConfigListener, Sit
         mBinding.dohText.setText(doh.getName());
     }
 
-    private void setAutoClearCache(View view) {
-        Setting.putAutoClearCache(!Setting.isAutoClearCache());
-        mBinding.autoClearCacheText.setText(getSwitch(Setting.isAutoClearCache()));
+    /**
+     * The settings row's plain click: clear every cache at once, the way this row behaved before it
+     * opened the cache management panel.
+     *
+     * <p>The full clean runs in the background and reports itself through a notification without
+     * opening the panel; the row re-reads itself when the cleanup publishes its change. With cache
+     * management switched off the legacy {@link FileUtil#clearCache} path is kept, because the panel
+     * and its cleanup engine belong to the feature that switch turns off.</p>
+     */
+    private void onCacheClear(View view) {
+        if (!CachePolicyStore.isManagementEnabled()) {
+            FileUtil.clearCache(new Callback() {
+                @Override
+                public void success() {
+                    setCacheText();
+                }
+            });
+            return;
+        }
+        CacheManagementDialog.cleanEverything();
     }
 
-    private void onCache(View view) {
-        FileUtil.clearCache(new Callback() {
-            @Override
-            public void success() {
-                setCacheText();
-            }
-        });
+    /**
+     * The settings row's long press: open the cache management panel (graded cleanup, module
+     * limits, auto cleanup and the running state).
+     *
+     * <p>With the plain click now clearing everything this is the panel's only entry. The row stays
+     * single-line by user request, so the gesture is not printed under the title and the panel is
+     * reached by the long press alone (deviation recorded in
+     * docs/CACHE-MGMT-01-cache-management-design.md). With cache management switched off there is
+     * no panel to open, so the long press keeps the legacy behaviour and repeats the plain clear.</p>
+     */
+    private boolean onCacheManage(View view) {
+        if (!CachePolicyStore.isManagementEnabled()) {
+            onCacheClear(view);
+            return true;
+        }
+        CacheManagementDialog.show(this);
+        return true;
     }
 
     private void onBackup(View view) {
         PermissionUtil.requestFile(this, allGranted -> {
+            if (!allGranted) {
+                Notify.show(R.string.backup_permission_denied);
+                return;
+            }
             BackupProgressDialog progress = BackupProgressDialog.open(getSupportFragmentManager(), "备份应用数据");
             AppDatabase.backup(new Callback() {
-            @Override
-            public void success() {
-                progress.finish();
-                Notify.show(R.string.backup_success);
-            }
+                @Override
+                public void success() {
+                    progress.finish();
+                    Notify.show(R.string.backup_success);
+                }
 
-            @Override
-            public void error() {
-                progress.finish();
-                Notify.show(R.string.backup_fail);
-            }
+                @Override
+                public void error() {
+                    progress.finish();
+                    Notify.show(R.string.backup_fail);
+                }
             }, progress::update);
         });
     }
 
     private void onRestore(View view) {
-        PermissionUtil.requestFile(this, allGranted -> RestoreDialog.create().callback(new Callback() {
-            @Override
-            public void success() {
-                Notify.show(R.string.restore_success);
-                setOtherText();
+        PermissionUtil.requestFile(this, allGranted -> {
+            if (!allGranted) {
+                Notify.show(R.string.backup_permission_denied);
+                return;
             }
+            RestoreDialog.create().callback(new Callback() {
+                @Override
+                public void success() {
+                    Notify.show(R.string.restore_success);
+                    setOtherText();
+                }
 
-            @Override
-            public void error() {
-                Notify.show(R.string.restore_fail);
-            }
-        }).show(this));
+                @Override
+                public void error() {
+                    Notify.show(R.string.restore_fail);
+                }
+            }).show(this);
+        });
     }
 
     private void initConfig() {
@@ -413,18 +460,21 @@ public class SettingActivity extends BaseActivity implements ConfigListener, Sit
         setWallText();
     }
 
-    private void setWallText() {
-        mBinding.wallUrl.setText(Setting.getWallDesc(WallConfig.getDesc()));
+    /**
+     * Re-reads the cache inventory the moment a cleanup (or any other cache mutation) finishes.
+     *
+     * <p>Without this the settings row kept the pre-cleanup value until the user left the activity
+     * and opened it again, because nothing told the row the cache had changed.</p>
+     */
+    @Subscribe(threadMode = ThreadMode.MAIN)
+    public void onRefreshEvent(RefreshEvent event) {
+        if (event.getType() != RefreshEvent.Type.CACHE) return;
+        if (mBinding == null || isFinishing() || isDestroyed()) return;
+        setCacheText();
     }
 
-    @Override
-    public boolean dispatchKeyEvent(KeyEvent event) {
-        if (KeyUtil.isMenuKey(event)) {
-            Updater.create().force().start(this);
-            return true;
-        }
-        if (FocusLoop.handle(this, FOCUS_GRID, FocusLoop.Mode.BOTH, event)) return true;
-        return super.dispatchKeyEvent(event);
+    private void setWallText() {
+        mBinding.wallUrl.setText(Setting.getWallDesc(WallConfig.getDesc()));
     }
 
 }

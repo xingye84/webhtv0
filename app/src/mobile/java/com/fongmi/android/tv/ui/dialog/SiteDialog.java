@@ -5,18 +5,14 @@ import android.graphics.drawable.ColorDrawable;
 import android.text.Editable;
 import android.text.TextUtils;
 import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
 import android.view.View;
-import android.view.ViewGroup;
-import android.view.ViewTreeObserver;
 import android.view.Window;
 import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
-import android.widget.Toast;
-import java.io.File;
 
 import androidx.annotation.NonNull;
-import androidx.appcompat.widget.LinearLayoutCompat;
-import androidx.core.content.ContextCompat;
+import androidx.core.widget.TextViewCompat;
 import androidx.fragment.app.Fragment;
 import androidx.recyclerview.widget.GridLayoutManager;
 import androidx.recyclerview.widget.ItemTouchHelper;
@@ -31,16 +27,20 @@ import com.fongmi.android.tv.databinding.DialogSiteBinding;
 import com.fongmi.android.tv.impl.SiteListener;
 import com.fongmi.android.tv.setting.Setting;
 import com.fongmi.android.tv.setting.SiteBlockSetting;
+import com.fongmi.android.tv.setting.SiteGroupOrderStore;
 import com.fongmi.android.tv.ui.adapter.SiteAdapter;
+import com.fongmi.android.tv.ui.adapter.SiteGroupAdapter;
 import com.fongmi.android.tv.ui.custom.CustomTextListener;
 import com.fongmi.android.tv.ui.custom.SpaceItemDecoration;
+import com.fongmi.android.tv.ui.helper.SiteDialogTheme;
 import com.fongmi.android.tv.utils.ResUtil;
 import com.fongmi.android.tv.utils.Util;
-import com.google.android.material.button.MaterialButton;
-import com.google.android.material.dialog.MaterialAlertDialogBuilder;
 import com.github.catvod.utils.Path;
+import com.google.android.material.dialog.MaterialAlertDialogBuilder;
 
-import java.util.ArrayList;
+import android.widget.Toast;
+
+import java.io.File;
 import java.util.List;
 
 public class SiteDialog extends BaseAlertDialog implements SiteAdapter.OnClickListener {
@@ -48,6 +48,7 @@ public class SiteDialog extends BaseAlertDialog implements SiteAdapter.OnClickLi
     private DialogSiteBinding binding;
     private SiteListener listener;
     private SiteAdapter adapter;
+    private SiteGroupAdapter groupAdapter;
     private ItemTouchHelper sortTouchHelper;
     private SpaceItemDecoration itemDecoration;
     private List<String> groups;
@@ -55,6 +56,7 @@ public class SiteDialog extends BaseAlertDialog implements SiteAdapter.OnClickLi
     private boolean search;
     private boolean change;
     private boolean block;
+    private boolean groupOrderChanged;
     private int columnCount = 1;
 
     public static SiteDialog create() {
@@ -83,68 +85,34 @@ public class SiteDialog extends BaseAlertDialog implements SiteAdapter.OnClickLi
 
     @Override
     protected MaterialAlertDialogBuilder getBuilder() {
-        return new MaterialAlertDialogBuilder(requireActivity(), R.style.ThemeOverlay_WebHTV_LightDialog).setView(getBinding().getRoot());
+        return builder().setView(getBinding().getRoot());
     }
 
     @Override
     protected void initView() {
-        adapter = new SiteAdapter(this);
+        SiteDialogTheme theme = SiteDialogTheme.resolve(binding.getRoot().getContext(), Setting.getDynamicColor());
+        binding.getRoot().setBackgroundResource(R.drawable.shape_site_dialog);
+        binding.keyword.setTextColor(theme.onSurface());
+        binding.keyword.setHintTextColor(theme.onSurfaceVariant());
+        TextViewCompat.setCompoundDrawableTintList(binding.keyword, theme.accent());
+        theme.tint(binding.block);
+        theme.tint(binding.search);
+        adapter = new SiteAdapter(this, theme);
+        groupAdapter = new SiteGroupAdapter(this::onGroupClick, theme);
         groups = getGroups();
         binding.recycler.setAdapter(adapter);
+        binding.groupList.setLayoutManager(new LinearLayoutManager(requireContext(), RecyclerView.HORIZONTAL, false));
+        binding.groupList.setAdapter(groupAdapter);
         adapter.search(search).change(change);
         setColumnCount(Setting.getSiteColumn());
         setGroupView();
         filter();
         binding.recycler.setItemAnimator(null);
         binding.recycler.setHasFixedSize(true);
+        binding.groupList.setItemAnimator(null);
         attachSortTouchHelper();
-        binding.recycler.getViewTreeObserver().addOnPreDrawListener(new ViewTreeObserver.OnPreDrawListener() {
-            @Override
-            public boolean onPreDraw() {
-                if (binding.recycler.getViewTreeObserver().isAlive()) {
-                    binding.recycler.getViewTreeObserver().removeOnPreDrawListener(this);
-                }
-                List<Site> showList = adapter.getItems();
-                Site active = VodConfig.get().getHome();
-                int targetPos = -1;
-                for (int i = 0; i < showList.size(); i++) {
-                    if (showList.get(i).getKey().equals(active.getKey())) {
-                        targetPos = i;
-                        break;
-                    }
-                }
-                if (targetPos < 0) {
-                    binding.recycler.scrollToPosition(0);
-                    return true;
-                }
-                RecyclerView.LayoutManager lm = binding.recycler.getLayoutManager();
-                final int finalTargetPos = targetPos;
-                if (lm instanceof LinearLayoutManager llm) {
-                    llm.scrollToPosition(finalTargetPos);
-                    final LinearLayoutManager finalLlm = llm;
-                    binding.recycler.post(() -> {
-                        View itemView = finalLlm.findViewByPosition(finalTargetPos);
-                        if (itemView == null) return;
-                        int rvHeight = binding.recycler.getHeight();
-                        int itemHeight = itemView.getHeight();
-                        int desiredOffset = rvHeight / 2 - itemHeight / 2;
-                        finalLlm.scrollToPositionWithOffset(finalTargetPos, desiredOffset);
-                    });
-                } else if (lm instanceof GridLayoutManager glm) {
-                    glm.scrollToPosition(finalTargetPos);
-                    final GridLayoutManager finalGlm = glm;
-                    binding.recycler.post(() -> {
-                        View itemView = finalGlm.findViewByPosition(finalTargetPos);
-                        if (itemView == null) return;
-                        int rvHeight = binding.recycler.getHeight();
-                        int itemHeight = itemView.getHeight();
-                        int desiredOffset = rvHeight / 2 - itemHeight / 2;
-                        finalGlm.scrollToPositionWithOffset(finalTargetPos, desiredOffset);
-                    });
-                }
-                return true;
-            }
-        });
+        attachGroupSortTouchHelper();
+        binding.recycler.post(() -> binding.recycler.scrollToPosition(adapter.getSelectedPosition()));
     }
 
     private void attachSortTouchHelper() {
@@ -169,6 +137,49 @@ public class SiteDialog extends BaseAlertDialog implements SiteAdapter.OnClickLi
             }
         });
         sortTouchHelper.attachToRecyclerView(binding.recycler);
+    }
+
+    private void attachGroupSortTouchHelper() {
+        ItemTouchHelper helper = new ItemTouchHelper(new ItemTouchHelper.SimpleCallback(ItemTouchHelper.LEFT | ItemTouchHelper.RIGHT, 0) {
+            @Override
+            public boolean isLongPressDragEnabled() {
+                return true;
+            }
+
+            @Override
+            public boolean isItemViewSwipeEnabled() {
+                return false;
+            }
+
+            @Override
+            public boolean onMove(@NonNull RecyclerView recyclerView, @NonNull RecyclerView.ViewHolder source, @NonNull RecyclerView.ViewHolder target) {
+                boolean moved = groupAdapter.move(source.getBindingAdapterPosition(), target.getBindingAdapterPosition());
+                groupOrderChanged = groupOrderChanged || moved;
+                return moved;
+            }
+
+            @Override
+            public void onSelectedChanged(RecyclerView.ViewHolder viewHolder, int actionState) {
+                super.onSelectedChanged(viewHolder, actionState);
+                if (actionState != ItemTouchHelper.ACTION_STATE_DRAG || viewHolder == null) return;
+                Util.hideKeyboard(binding.keyword);
+                viewHolder.itemView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+            }
+
+            @Override
+            public void clearView(@NonNull RecyclerView recyclerView, @NonNull RecyclerView.ViewHolder viewHolder) {
+                super.clearView(recyclerView, viewHolder);
+                if (!groupOrderChanged) return;
+                groupOrderChanged = false;
+                groups = groupAdapter.getItems();
+                SiteGroupOrderStore.save(getAllGroups(), groups);
+            }
+
+            @Override
+            public void onSwiped(@NonNull RecyclerView.ViewHolder viewHolder, int direction) {
+            }
+        });
+        helper.attachToRecyclerView(binding.groupList);
     }
 
     @Override
@@ -218,63 +229,40 @@ public class SiteDialog extends BaseAlertDialog implements SiteAdapter.OnClickLi
     }
 
     private List<String> getGroups() {
-        return new ArrayList<>(Site.getGroups(SiteBlockSetting.filter(VodConfig.get().getSites(), block)));
+        return SiteGroupOrderStore.sort(Site.getGroups(SiteBlockSetting.filter(VodConfig.get().getSites(), block)));
+    }
+
+    private List<String> getAllGroups() {
+        return Site.getGroups(SiteBlockSetting.filter(VodConfig.get().getSites(), true));
     }
 
     private void setGroupView() {
+        groupOrderChanged = false;
         if (groups.isEmpty()) {
             selectedGroup = "";
-            binding.groupScroll.setVisibility(View.GONE);
+            groupAdapter.submit(groups, selectedGroup);
+            binding.groupList.setVisibility(View.GONE);
             return;
         }
         if (!TextUtils.isEmpty(selectedGroup) && !groups.contains(selectedGroup)) selectedGroup = "";
-        binding.groupScroll.setVisibility(View.VISIBLE);
-        binding.groupList.removeAllViews();
-        for (String group : groups) binding.groupList.addView(getGroupView(group));
-        updateGroupView();
-    }
-
-    private MaterialButton getGroupView(String group) {
-        MaterialButton button = new MaterialButton(requireContext(), null, com.google.android.material.R.attr.materialButtonOutlinedStyle);
-        LinearLayoutCompat.LayoutParams params = new LinearLayoutCompat.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        params.setMarginEnd(ResUtil.dp2px(8));
-        button.setLayoutParams(params);
-        button.setText(group);
-        button.setSingleLine(true);
-        button.setAllCaps(false);
-        button.setMinWidth(0);
-        button.setMinHeight(0);
-        button.setMinimumWidth(0);
-        button.setMinimumHeight(0);
-        button.setInsetTop(0);
-        button.setInsetBottom(0);
-        button.setPadding(ResUtil.dp2px(14), ResUtil.dp2px(6), ResUtil.dp2px(14), ResUtil.dp2px(6));
-        button.setTextColor(ContextCompat.getColorStateList(requireContext(), R.color.dialog_outlined_button_text));
-        button.setBackgroundTintList(ContextCompat.getColorStateList(requireContext(), R.color.dialog_outlined_button_bg));
-        button.setStrokeColor(ContextCompat.getColorStateList(requireContext(), R.color.dialog_outlined_button_stroke));
-        button.setOnClickListener(v -> onGroupClick(group, button));
-        return button;
+        binding.groupList.setVisibility(View.VISIBLE);
+        groupAdapter.submit(groups, selectedGroup);
     }
 
     private void onGroupClick(String group, View view) {
         selectedGroup = group.equals(selectedGroup) ? "" : group;
         updateGroupView();
         filter();
-        binding.recycler.scrollToPosition(0);
+        binding.recycler.post(() -> binding.recycler.scrollToPosition(adapter.getSelectedPosition()));
         if (!TextUtils.isEmpty(selectedGroup)) centerGroup(view);
     }
 
     private void updateGroupView() {
-        for (int i = 0; i < binding.groupList.getChildCount(); i++) {
-            View view = binding.groupList.getChildAt(i);
-            boolean selected = ((MaterialButton) view).getText().toString().equals(selectedGroup);
-            view.setSelected(selected);
-            view.setAlpha(TextUtils.isEmpty(selectedGroup) || selected ? 1.0f : 0.5f);
-        }
+        groupAdapter.select(selectedGroup);
     }
 
     private void centerGroup(View view) {
-        binding.groupScroll.post(() -> binding.groupScroll.smoothScrollTo(Math.max(0, view.getLeft() + view.getWidth() / 2 - binding.groupScroll.getWidth() / 2), 0));
+        binding.groupList.post(() -> binding.groupList.smoothScrollBy(view.getLeft() + view.getWidth() / 2 - binding.groupList.getWidth() / 2, 0));
     }
 
     private void filter() {
@@ -368,11 +356,8 @@ public class SiteDialog extends BaseAlertDialog implements SiteAdapter.OnClickLi
             }
             Site fallbackHome = new Site();
             if (delIndex != -1 && siteList.size() > 1) {
-                if (delIndex + 1 < siteList.size()) {
-                    fallbackHome = siteList.get(delIndex + 1);
-                } else {
-                    fallbackHome = siteList.get(delIndex - 1);
-                }
+                if (delIndex + 1 < siteList.size()) fallbackHome = siteList.get(delIndex + 1);
+                else fallbackHome = siteList.get(delIndex - 1);
             }
             VodConfig.get().setHome(fallbackHome);
         }

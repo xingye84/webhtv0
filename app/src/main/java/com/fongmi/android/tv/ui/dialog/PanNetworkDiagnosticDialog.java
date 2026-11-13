@@ -29,6 +29,7 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.fragment.app.DialogFragment;
 import androidx.fragment.app.FragmentActivity;
+import androidx.fragment.app.FragmentManager;
 import androidx.media3.common.Format;
 
 import com.fongmi.android.tv.R;
@@ -38,13 +39,14 @@ import com.fongmi.android.tv.player.diagnostic.PanDiagnosticVerdict;
 import com.fongmi.android.tv.player.diagnostic.PanEndpoint;
 import com.fongmi.android.tv.player.diagnostic.PanEndpointParser;
 import com.fongmi.android.tv.player.diagnostic.PanNetworkDiagnosticRunner;
+import com.fongmi.android.tv.theme.WebHtvAlertDialogBuilder;
+import com.fongmi.android.tv.ui.helper.TvFocusScale;
 import com.fongmi.android.tv.utils.Notify;
 import com.fongmi.android.tv.utils.ResUtil;
 import com.fongmi.android.tv.utils.Util;
 import com.google.android.material.button.MaterialButton;
 import com.google.android.material.chip.Chip;
 import com.google.android.material.chip.ChipGroup;
-import com.google.android.material.dialog.MaterialAlertDialogBuilder;
 import com.google.android.material.progressindicator.LinearProgressIndicator;
 import com.google.android.material.tabs.TabLayout;
 
@@ -64,6 +66,7 @@ public final class PanNetworkDiagnosticDialog extends DialogFragment implements 
     private static final int SURFACE = Color.rgb(248, 249, 250);
     private static final int SUCCESS = Color.rgb(24, 128, 56);
     private static final int WARNING = Color.rgb(180, 93, 0);
+    private static final long HIGH_TRAFFIC_CONFIRM_BYTES = 2L * 1024L * 1024L * 1024L;
     private PlayerManager player;
     private PanNetworkDiagnosticRunner runner;
     private PanEndpoint endpoint;
@@ -96,12 +99,15 @@ public final class PanNetworkDiagnosticDialog extends DialogFragment implements 
 
     public static void show(FragmentActivity activity, PlayerManager player) {
         if (activity == null || player == null || player.isReleased()) return;
-        for (androidx.fragment.app.Fragment fragment : activity.getSupportFragmentManager().getFragments()) {
+        if (activity.isFinishing() || activity.isDestroyed()) return;
+        FragmentManager fragmentManager = activity.getSupportFragmentManager();
+        if (fragmentManager.isStateSaved()) return;
+        for (androidx.fragment.app.Fragment fragment : fragmentManager.getFragments()) {
             if (fragment instanceof PanNetworkDiagnosticDialog) return;
         }
         PanNetworkDiagnosticDialog dialog = new PanNetworkDiagnosticDialog();
         dialog.player = player;
-        dialog.show(activity.getSupportFragmentManager(), PanNetworkDiagnosticDialog.class.getSimpleName());
+        dialog.show(fragmentManager, PanNetworkDiagnosticDialog.class.getSimpleName());
     }
 
     @NonNull
@@ -117,7 +123,7 @@ public final class PanNetworkDiagnosticDialog extends DialogFragment implements 
         contentScroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
         content = vertical(0);
         contentScroll.addView(content, new ScrollView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        int screenHeight = ResUtil.getScreenHeight(requireContext());
+        int screenHeight = DialogSafeArea.height(requireContext());
         int contentHeight = Util.isLeanback()
                 ? Math.min(dp(460), Math.max(dp(400), screenHeight - dp(300)))
                 : Math.min(dp(560), Math.max(dp(350), screenHeight * 5 / 8));
@@ -130,7 +136,7 @@ public final class PanNetworkDiagnosticDialog extends DialogFragment implements 
         root.addView(resultFooter, footerParams);
         resolveEndpoint();
         showConfig();
-        Dialog dialog = new MaterialAlertDialogBuilder(requireActivity(), R.style.ThemeOverlay_WebHTV_LightDialog).setView(root).create();
+        Dialog dialog = new WebHtvAlertDialogBuilder(requireActivity(), R.style.ThemeOverlay_WebHTV_Dialog).setView(root).create();
         dialog.setCanceledOnTouchOutside(false);
         return dialog;
     }
@@ -426,23 +432,21 @@ public final class PanNetworkDiagnosticDialog extends DialogFragment implements 
             return;
         }
         int maxThreads = threads.get(threads.size() - 1);
-        if (maxThreads > 64 && !highThreadConfirmed) {
-            confirmHighThread(threads);
+        long bytes = estimatePlanBytes(threads);
+        if ((maxThreads > 64 || bytes >= HIGH_TRAFFIC_CONFIRM_BYTES) && !highThreadConfirmed) {
+            confirmHighThread(threads, bytes);
             return;
         }
         highThreadConfirmed = false;
         startConfirmedTest(threads);
     }
 
-    private void confirmHighThread(List<Integer> threads) {
-        long required = formatBitrate(player.getVideoFormat());
+    private void confirmHighThread(List<Integer> threads, long bytes) {
         int maxThreads = threads.get(threads.size() - 1);
-        long bytes = PanBenchmarkPlan.estimateTotalBytes(required, threads, mode, 0)
-                + PanBenchmarkPlan.roundBudgetBytes(required, 1, mode)
-                + PanBenchmarkPlan.roundBudgetBytes(required, maxThreads, mode);
-        new MaterialAlertDialogBuilder(requireContext(), R.style.ThemeOverlay_WebHTV_LightDialog)
-                .setTitle("确认高线程诊断")
-                .setMessage("将测试到 " + maxThreads + " 线程，预计流量上限约 " + PanNetworkDiagnosticRunner.formatBytes(bytes) + "。高线程可能增加耗电、内存占用，并触发源站或网盘限流、风控。")
+        new WebHtvAlertDialogBuilder(requireContext(), R.style.ThemeOverlay_WebHTV_Dialog)
+                .setTitle("确认高流量诊断")
+                .setMessage("将测试到 " + maxThreads + " 线程，预计流量上限约 " + PanNetworkDiagnosticRunner.formatBytes(bytes)
+                        + "，已计入探测、预热、重复、直链对照、App DataSource、配对验证和各可重试阶段的一次瞬态断流重试。高线程可能增加耗电、内存占用，并触发源站或网盘限流、风控。")
                 .setNegativeButton("返回调整", null)
                 .setPositiveButton("继续诊断", (dialog, which) -> {
                     highThreadConfirmed = true;
@@ -526,6 +530,7 @@ public final class PanNetworkDiagnosticDialog extends DialogFragment implements 
 
     @Override
     public void onComplete(PanNetworkDiagnosticRunner.Report report) {
+        if (!running || !isAdded()) return;
         running = false;
         resumePlayback();
         showResult(report);
@@ -540,6 +545,7 @@ public final class PanNetworkDiagnosticDialog extends DialogFragment implements 
 
     @Override
     public void onError(String message) {
+        if (!running || !isAdded()) return;
         running = false;
         resumePlayback();
         hideResultFooter();
@@ -679,26 +685,27 @@ public final class PanNetworkDiagnosticDialog extends DialogFragment implements 
             return;
         }
         int maxThreads = values.get(values.size() - 1);
-        long required = formatBitrate(player == null ? null : player.getVideoFormat());
         int repeats = PanBenchmarkPlan.repeats(mode);
-        long bytesPerCycle = PanBenchmarkPlan.roundBudgetBytes(required, 1, mode)
-                + PanBenchmarkPlan.roundBudgetBytes(required, maxThreads, mode);
-        for (int value : values) {
-            bytesPerCycle += PanBenchmarkPlan.roundBudgetBytes(required, value, mode);
-            if (value > 1) bytesPerCycle += PanBenchmarkPlan.roundBudgetBytes(required, PanBenchmarkPlan.directConcurrency(value), mode);
-        }
-        long bytes = bytesPerCycle * repeats;
-        boolean proxied = endpoint != null && endpoint.hasDirectUpstream() && !endpoint.playbackUrl().equals(endpoint.upstreamUrl());
-        if (proxied && repeats > 1) bytes += PanBenchmarkPlan.roundBudgetBytes(required, maxThreads, mode) * repeats;
+        long bytes = estimatePlanBytes(values);
         int directGroups = 0;
         for (int value : values) if (value > 1) directGroups++;
+        boolean proxied = endpoint != null && endpoint.hasDirectUpstream() && !endpoint.playbackUrl().equals(endpoint.upstreamUrl());
         int rounds = repeats * (2 + (proxied ? values.size() + directGroups : 0)) + (proxied && repeats > 1 ? repeats : 0);
         long seconds = 5 + rounds * PanBenchmarkPlan.roundTimeLimitMs(mode) / 1000L;
         String action = values.size() == 1 ? "将测试 " + values.get(0) + " 线程" : "将对比 " + join(values) + " 线程";
         String directLimit = maxThreads > PanBenchmarkPlan.MAX_DIRECT_CONCURRENCY ? "；直链并发基准安全封顶" + PanBenchmarkPlan.MAX_DIRECT_CONCURRENCY + "路" : "";
         String safety = Util.isLeanback() ? " · 开始后暂停播放，结束自动恢复；不使用系统代理" : "";
         estimate.setText(action + " · " + repeats + "轮取中位数" + directLimit + "\n预计流量上限约 " + PanNetworkDiagnosticRunner.formatBytes(bytes)
-                + " · 预计不超过 " + formatTime(seconds) + "（单轮 " + formatTime(PanBenchmarkPlan.roundTimeLimitMs(mode) / 1000L) + "，连接/断流超时另计）" + safety);
+                + " · 基础耗时约 " + formatTime(seconds) + "（单轮 " + formatTime(PanBenchmarkPlan.roundTimeLimitMs(mode) / 1000L) + "，断流重试可能增加耗时）" + safety);
+    }
+
+    private long estimatePlanBytes(List<Integer> threads) {
+        long required = formatBitrate(player == null ? null : player.getVideoFormat());
+        boolean proxied = endpoint != null && endpoint.hasDirectUpstream() && !endpoint.playbackUrl().equals(endpoint.upstreamUrl());
+        int configuredThreads = endpoint == null ? 0 : endpoint.configuredThreads();
+        int appThreads = proxied ? Math.max(PanBenchmarkPlan.normalizeThreads(configuredThreads), threads.get(threads.size() - 1))
+                : PanBenchmarkPlan.normalizeThreads(configuredThreads);
+        return PanBenchmarkPlan.estimatePlannedBytes(required, threads, mode, proxied, appThreads);
     }
 
     private int defaultThreads() {
@@ -868,6 +875,7 @@ public final class PanNetworkDiagnosticDialog extends DialogFragment implements 
 
     @Override
     public void onDestroy() {
+        running = false;
         if (runner != null) runner.release();
         resumePlayback();
         super.onDestroy();
@@ -907,7 +915,7 @@ public final class PanNetworkDiagnosticDialog extends DialogFragment implements 
         button.setStrokeColor(ColorStateList.valueOf(primary ? BLUE : Color.rgb(138, 180, 248)));
         button.setStrokeWidth(dp(1));
         button.setOnFocusChangeListener((v, focused) -> {
-            v.animate().scaleX(focused ? 1.035f : 1f).scaleY(focused ? 1.035f : 1f).setDuration(100).start();
+            TvFocusScale.applyCompact(v, focused);
             if (!primary) {
                 button.setTextColor(ColorStateList.valueOf(focused ? Color.WHITE : BLUE_DARK));
                 button.setBackgroundTintList(ColorStateList.valueOf(focused ? BLUE : Color.WHITE));

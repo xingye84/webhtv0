@@ -67,6 +67,14 @@ final class MpvDiagnosticsPolicy {
         };
     }
 
+    static boolean allowsDetailedDiagnostics(Request request, boolean debugLogEnabled) {
+        if (request == null) return false;
+        return switch (request) {
+            case PANEL, PLAYBACK, ERROR_MINIMAL -> false;
+            case DEBUG_LOG, ERROR_DETAILED -> debugLogEnabled;
+        };
+    }
+
     static String sourceSummary(String source) {
         String value = source == null ? "" : source.trim();
         String scheme = scheme(value);
@@ -74,7 +82,9 @@ final class MpvDiagnosticsPolicy {
     }
 
     static String redactSensitive(String text) {
-        return text == null ? "" : text;
+        if (text == null || text.isEmpty()) return "";
+        String safe = URL.matcher(text).replaceAll("<url>");
+        return SENSITIVE_HEADER.matcher(safe).replaceAll("$1=<redacted>");
     }
 
     /** Persist startup/failure evidence without waiting for the Android main queue. */

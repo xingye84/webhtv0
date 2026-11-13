@@ -12,45 +12,64 @@ import java.util.regex.Pattern;
 /** The common boundary for untrusted legacy/native text. Structured fields also use it. */
 public final class DiagnosticText {
     public static final int MAX_CHARS = 12_000;
-    private static final String REDACTED = "[redacted]";
     private static final Pattern URI_TEXT = Pattern.compile("(?i)(?:[a-z][a-z0-9+.-]{1,24}:)?//[^\\s<>\"'\\\\]+|(?:file|content|magnet):[^\\s<>\"']+");
-    private static final Pattern HEADER = Pattern.compile("(?im)(?:[\"']?)(?:authorization|proxy-authorization|cookie|set-cookie|referer)(?:[\"']?)\\s*[:=]\\s*[^\\r\\n]*");
-    private static final Pattern SECRET = Pattern.compile("(?i)(?<![a-z0-9_.-])([\"']?(?:[a-z0-9_.-]{0,48}(?:token|password|passwd|secret|credential|cookie|authorization|license|sessionkey|api[_-]?key|access[_-]?key|share[_-]?key|username|account|email|phone|serial|url|uri|payload|body)[a-z0-9_.-]{0,48})[\"']?\\s*[:=]\\s*)(?:\"[^\"]*\"|'[^']*'|[^\\s,;&}\\]]+)");
-    private static final Pattern BEARER = Pattern.compile("(?i)\\b(?:bearer|basic)\\s+[a-z0-9+/_.=~-]+");
-    private static final Pattern LOCAL_PATH = Pattern.compile("/(?:storage|sdcard|data/user|data/data|mnt/media_rw)/[^\\s\"'<>]*");
-    private static final Pattern ADDRESS = Pattern.compile("(?i)\\b(?:[0-9]{1,3}\\.){3}[0-9]{1,3}\\b|\\b(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\\b");
 
     private DiagnosticText() {}
 
     public record Clean(String text, boolean truncated) {}
 
     public static Clean clean(String input) {
-        return clean(input, true);
-    }
-
-    /** 调试日志仅本机/局域网自看，不做脱敏，只截断超长行和转义控制字符。 */
-    public static Clean clean(String input, boolean redactUrls) {
         if (input == null) return new Clean("", false);
         boolean truncated = input.length() > MAX_CHARS;
         String value = input.substring(0, Math.min(MAX_CHARS, input.length())).replace("\\/", "/");
-        StringBuilder result = new StringBuilder(Math.min(MAX_CHARS, value.length()));
-        for (int i = 0; i < value.length() && result.length() < MAX_CHARS; i++) {
+        // 与 fish 一致：调试日志只给自己看，不打码，保留完整路径、链接与参数，否则无法排查问题。
+        String escaped = escape(value);
+        truncated |= escaped.length() >= MAX_CHARS;
+        return new Clean(truncated ? escaped + " [truncated]" : escaped, truncated);
+    }
+
+    /**
+     * Short label text: escaped, and capped at {@link #MAX_CHARS} like {@link #clean}.
+     * Plain labels without special characters skip the escape scan fast path.
+     */
+    public static String sanitizeTag(String tag) {
+        if (tag == null) return "";
+        String value = tag.length() > MAX_CHARS ? tag.substring(0, MAX_CHARS) : tag;
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c == '/' || c == ':' || c == '=' || c == '@' || c == '.' || c <= ' ') return clean(value).text();
+        }
+        return escape(value);
+    }
+
+    private static String escape(String value) {
+        int limit = Math.min(MAX_CHARS, value.length());
+        boolean needed = false;
+        for (int i = 0; i < limit; i++) {
+            if (isEscapedControl(value.charAt(i))) { needed = true; break; }
+        }
+        if (!needed) return value.length() <= MAX_CHARS ? value : value.substring(0, MAX_CHARS);
+        StringBuilder result = new StringBuilder(limit);
+        for (int i = 0; i < limit && result.length() < MAX_CHARS; i++) {
             char c = value.charAt(i);
             if (c == '\n') result.append("\\n");
             else if (c == '\r') result.append("\\r");
             else if (c == '\t') result.append("\\t");
-            else if (Character.isISOControl(c) || c == '\u2028' || c == '\u2029' || (c >= '\u202a' && c <= '\u202e')) result.append('?');
+            else if (isEscapedControl(c)) result.append('?');
             else result.append(c);
         }
-        truncated |= result.length() >= MAX_CHARS;
-        if (truncated) result.append(" [truncated]");
-        return new Clean(result.toString(), truncated);
+        return result.toString();
+    }
+
+    private static boolean isEscapedControl(char c) {
+        return Character.isISOControl(c) || c == '\u2028' || c == '\u2029' || (c >= '\u202a' && c <= '\u202e');
     }
 
     /** Domain suggestions are local memory only, never part of an exported event. */
     public static List<String> origins(String input) {
         if (input == null) return List.of();
         String value = input.substring(0, Math.min(MAX_CHARS, input.length())).replace("\\/", "/");
+        if (value.indexOf('/') < 0 && value.indexOf(':') < 0) return List.of();
         Matcher matcher = URI_TEXT.matcher(value);
         List<String> result = new ArrayList<>();
         while (matcher.find() && result.size() < 16) {

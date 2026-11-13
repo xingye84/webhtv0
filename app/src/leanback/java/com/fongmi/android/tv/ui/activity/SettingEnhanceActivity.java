@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
+import android.util.TypedValue;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
@@ -12,15 +13,24 @@ import android.widget.TextView;
 import androidx.viewbinding.ViewBinding;
 
 import com.fongmi.android.tv.R;
+import com.fongmi.android.tv.bean.AudioConfig;
+import com.fongmi.android.tv.bean.ShortDramaConfig;
 import com.fongmi.android.tv.gitcloud.GitCloudAccountStore;
+import com.fongmi.android.tv.lab.LabActivity;
 import com.fongmi.android.tv.playback.ViewingRecordSyncStore;
+import com.fongmi.android.tv.plugin.PluginSourceConfig;
 import com.fongmi.android.tv.remote.RemoteStore;
 import com.fongmi.android.tv.setting.Setting;
 import com.fongmi.android.tv.databinding.ActivitySettingEnhanceBinding;
 import com.fongmi.android.tv.setting.CustomCspSetting;
 import com.fongmi.android.tv.setting.ProxySetting;
 import com.fongmi.android.tv.setting.SiteHealthStore;
+import com.fongmi.android.tv.setting.SiteNameStore;
+import com.fongmi.android.tv.ui.activity.PluginManagerActivity;
 import com.fongmi.android.tv.ui.base.BaseActivity;
+import com.fongmi.android.tv.ui.dialog.AudioSourceDialog;
+import com.fongmi.android.tv.ui.dialog.ShortDramaSourceDialog;
+import com.fongmi.android.tv.ui.dialog.SourceBlockDialog;
 import com.fongmi.android.tv.ui.dialog.CspWarmupDialog;
 import com.fongmi.android.tv.ui.dialog.CustomCspDialog;
 import com.fongmi.android.tv.ui.dialog.DebugLogDialog;
@@ -31,22 +41,23 @@ import com.fongmi.android.tv.ui.dialog.OneKeySyncDialog;
 import com.fongmi.android.tv.ui.dialog.RemoteTrustDialog;
 import com.fongmi.android.tv.ui.dialog.ShellProxyDialog;
 import com.fongmi.android.tv.ui.dialog.SiteHealthDialog;
-import com.fongmi.android.tv.ui.dialog.SourceBlockDialog;
+import com.fongmi.android.tv.ui.dialog.SiteNameDialog;
 import com.fongmi.android.tv.ui.dialog.ViewingRecordSyncDialog;
 import com.fongmi.android.tv.ui.dialog.WebHomeExtensionDialog;
+import com.fongmi.android.tv.ui.dialog.WebHomeThemeDialog;
 import com.fongmi.android.tv.utils.FocusLoop;
-import com.fongmi.android.tv.utils.KeyUtil;
 import com.fongmi.android.tv.utils.LoginStateSync;
 import com.fongmi.android.tv.utils.Notify;
 import com.fongmi.android.tv.utils.PermissionUtil;
-import com.fongmi.android.tv.web.ext.WebHomeExtensionRegistry;
 import com.github.catvod.crawler.SpiderDebug;
+import com.fongmi.android.tv.web.ext.WebHomeExtensionRegistry;
 
 public class SettingEnhanceActivity extends BaseActivity {
 
     private static final String URL_GITHUB = "https://github.com/llb0/webhtv";
 
     private ActivitySettingEnhanceBinding mBinding;
+    private int[][] focusGrid;
 
     public static void start(Activity activity) {
         activity.startActivity(new Intent(activity, SettingEnhanceActivity.class));
@@ -64,20 +75,31 @@ public class SettingEnhanceActivity extends BaseActivity {
     @Override
     protected void initView(Bundle savedInstanceState) {
         reorderItems();
-        mBinding.fileSites.requestFocus();
+        mBinding.githubRepo.requestFocus();
         setText();
+    }
+
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        if (FocusLoop.handle(this, focusGrid, FocusLoop.Mode.VERTICAL, event)) return true;
+        return super.dispatchKeyEvent(event);
     }
 
     @Override
     protected void initEvent() {
         mBinding.githubRepo.setOnClickListener(view -> openRepo(URL_GITHUB));
-        mBinding.fileSites.setOnClickListener(this::setFileSites);
+        mBinding.lab.setOnClickListener(view -> LabActivity.start(this));
         mBinding.driveCheck.setOnClickListener(this::setDriveCheck);
+        mBinding.siteName.setOnClickListener(this::setSiteName);
+        mBinding.audioSource.setOnClickListener(this::setAudioSource);
+        mBinding.shortDramaSource.setOnClickListener(this::setShortDramaSource);
         mBinding.debugLog.setOnClickListener(this::setDebugLog);
+        mBinding.fileSites.setOnClickListener(view -> SourceBlockDialog.show(this, this::setText));
         mBinding.siteHealthSort.setOnClickListener(view -> SiteHealthDialog.show(this, this::setText));
         mBinding.siteHealthSort.setOnLongClickListener(this::clearSiteHealth);
         mBinding.webHomeExtension.setOnClickListener(view -> WebHomeExtensionDialog.show(this, this::setText));
         mBinding.webHomeExtension.setOnLongClickListener(this::clearWebHomeExtension);
+        mBinding.webHomeTheme.setOnClickListener(view -> WebHomeThemeDialog.show(this, this::setText));
         mBinding.webHomeFullscreen.setOnClickListener(this::setWebHomeFullscreen);
         mBinding.cspWarmup.setOnClickListener(this::setCspWarmup);
         mBinding.playbackArtworkWall.setOnClickListener(this::setPlaybackArtworkWall);
@@ -95,18 +117,13 @@ public class SettingEnhanceActivity extends BaseActivity {
         }));
         mBinding.loginState.setOnClickListener(view -> LoginStateLearnDialog.show(this, this::setText));
         mBinding.oneKeySync.setOnClickListener(v -> OneKeySyncDialog.create().show(this));
-    }
-
-    @Override
-    public boolean dispatchKeyEvent(KeyEvent event) {
-        if (FocusLoop.handleChildGrid(mBinding.content, 1, FocusLoop.Mode.VERTICAL, event)) return true;
-        return super.dispatchKeyEvent(event);
+        mBinding.pluginManager.setOnClickListener(view -> PluginManagerActivity.start(this));
     }
 
     private void reorderItems() {
         ViewGroup parent = (ViewGroup) mBinding.customCsp.getParent();
         View[] order = {
-                mBinding.fileSites,
+                mBinding.lab,
                 mBinding.customCsp,
                 mBinding.webHomeExtension,
                 mBinding.gitCloud,
@@ -116,28 +133,63 @@ public class SettingEnhanceActivity extends BaseActivity {
                 mBinding.shellProxy,
                 mBinding.shellProxyConfig,
                 mBinding.managePage,
+                mBinding.webHomeTheme,
                 mBinding.webHomeFullscreen,
                 mBinding.cspWarmup,
                 mBinding.playbackArtworkWall,
                 mBinding.driveCheck,
+                mBinding.siteName,
+                mBinding.audioSource,
+                mBinding.shortDramaSource,
                 mBinding.siteHealthSort,
                 mBinding.debugLog,
-                mBinding.playbackWebhook
+                mBinding.fileSites,
+                mBinding.playbackWebhook,
+                mBinding.pluginManager
         };
         for (View view : order) parent.removeView(view);
         for (View view : order) parent.addView(view);
+        focusGrid = new int[][]{
+                {mBinding.githubRepo.getId()},
+                {mBinding.lab.getId()},
+                {mBinding.customCsp.getId()},
+                {mBinding.webHomeExtension.getId()},
+                {mBinding.gitCloud.getId()},
+                {mBinding.remoteTrust.getId()},
+                {mBinding.oneKeySync.getId()},
+                {mBinding.loginState.getId()},
+                {mBinding.shellProxy.getId()},
+                {mBinding.managePage.getId()},
+                {mBinding.webHomeTheme.getId()},
+                {mBinding.webHomeFullscreen.getId()},
+                {mBinding.cspWarmup.getId()},
+                {mBinding.playbackArtworkWall.getId()},
+                {mBinding.driveCheck.getId()},
+                {mBinding.siteName.getId()},
+                {mBinding.audioSource.getId()},
+                {mBinding.shortDramaSource.getId()},
+                {mBinding.siteHealthSort.getId()},
+                {mBinding.debugLog.getId()},
+                {mBinding.fileSites.getId()},
+                {mBinding.playbackWebhook.getId()},
+                {mBinding.pluginManager.getId()}
+        };
     }
 
     private void setText() {
         if (!canSetText()) return;
-        safeSet("fileSites", mBinding.fileSitesText, () -> getString(R.string.setting_source_block_count, Setting.getSourceBlockedCount(), Setting.SOURCE_ALL.length));
         safeSet("driveCheck", mBinding.driveCheckText, () -> getSwitch(Setting.isDriveCheck()));
+        safeSet("siteName", mBinding.siteNameText, () -> getString(R.string.setting_site_name_summary, SiteNameStore.count()));
+        safeSet("audioSource", mBinding.audioSourceText, () -> getSwitch(!AudioConfig.objectFrom(Setting.getAudioConfig()).getDisplayRules().isEmpty()));
+        safeSet("shortDramaSource", mBinding.shortDramaSourceText, () -> getSwitch(!ShortDramaConfig.objectFrom(Setting.getShortDramaConfig()).getDisplayRules().isEmpty()));
         safeSet("debugLog", mBinding.debugLogText, () -> getSwitch(Setting.isDebugLog()));
-        safeSet("siteHealthSort", mBinding.siteHealthSortText, () -> getSwitch(Setting.isSiteHealthSort()));
+        safeSet("fileSites", mBinding.fileSitesText, () -> getString(R.string.setting_source_block_count, Setting.getSourceBlockedCount(), Setting.SOURCE_ALL.length));
+        safeSet("siteHealthSort", mBinding.siteHealthSortText, this::getSiteHealthText);
         safeSet("webHomeExtension", mBinding.webHomeExtensionText, () -> {
             WebHomeExtensionRegistry.Snapshot webHomeExtension = WebHomeExtensionRegistry.get().snapshot();
             return getSwitch(Setting.isWebHomeExtension()) + " · " + webHomeExtension.readyCount + "/" + webHomeExtension.installedCount;
         });
+        safeSet("webHomeTheme", mBinding.webHomeThemeText, () -> WebHomeThemeDialog.summary(this));
         safeSet("webHomeFullscreen", mBinding.webHomeFullscreenText, () -> getSwitch(Setting.isWebHomeFullscreen()));
         safeSet("cspWarmup", mBinding.cspWarmupText, this::getCspWarmupText);
         safeSet("playbackArtworkWall", mBinding.playbackArtworkWallText, () -> getSwitch(Setting.isPlaybackArtworkWall()));
@@ -145,6 +197,7 @@ public class SettingEnhanceActivity extends BaseActivity {
         safeSet("managePage", mBinding.managePageText, () -> getString(R.string.manage_page_web));
         safeSet("remoteTrust", mBinding.remoteTrustText, () -> RemoteStore.summary(this));
         safeSet("gitCloud", mBinding.gitCloudText, () -> getString(R.string.git_cloud_account_count, GitCloudAccountStore.list().size()));
+        safeSet("pluginManager", mBinding.pluginManagerText, () -> getString(R.string.plugin_manager_entry_count, PluginSourceConfig.get().entries().size()));
         setShellProxyText();
         setCustomCspText();
         safeSet("loginState", mBinding.loginStateText, () -> {
@@ -161,8 +214,8 @@ public class SettingEnhanceActivity extends BaseActivity {
     private void setShellProxyText() {
         safeRun("shellProxy", () -> {
             int count = ProxySetting.count();
-            mBinding.shellProxyText.setText(getSwitch(Setting.isShellProxy()) + " · " + getString(R.string.setting_proxy_rule_count, count));
-            mBinding.shellProxyConfigText.setText(getString(R.string.setting_proxy_rule_count, count));
+            setSummary(mBinding.shellProxyText, getSwitch(Setting.isShellProxy()) + " · " + getString(R.string.setting_proxy_rule_count, count));
+            setSummary(mBinding.shellProxyConfigText, getString(R.string.setting_proxy_rule_count, count));
         }, () -> {
             setError(mBinding.shellProxyText);
             setError(mBinding.shellProxyConfigText);
@@ -177,12 +230,55 @@ public class SettingEnhanceActivity extends BaseActivity {
                 return;
             }
             CustomCspSetting.Count count = status.count();
-            mBinding.customCspText.setText(getSwitch(status.enabled()) + " · " + getString(R.string.setting_custom_csp_count, count.active(), count.enabled()));
+            setSummary(mBinding.customCspText, getSwitch(status.enabled()) + " · " + getString(R.string.setting_custom_csp_count, count.active(), count.enabled()));
         }, () -> setError(mBinding.customCspText));
     }
 
     private void safeSet(String name, TextView view, TextSupplier supplier) {
-        safeRun(name, () -> view.setText(supplier.get()), () -> setError(view));
+        safeRun(name, () -> setSummary(view, supplier.get()), () -> setError(view));
+    }
+
+    /**
+     * 写入取值摘要，并把颜色复位到常规壁纸前景色。
+     *
+     * <p>复位这一步是必需的：{@link #setError} 会把同一个 TextView 染成错误色，而这些摘要
+     * 全部**复用同一个控件**——不复位的话，某一行失败一次之后，即使后续刷新成功，
+     * 它也会一直显示为红色。
+     */
+    private void setSummary(TextView view, CharSequence text) {
+        if (view == null) return;
+        view.setText(text);
+        view.setTextColor(themeColor(R.attr.webhtvColorOnWallpaper));
+        // 撤掉错误底材：错误态是"临时"的，刷新成功必须完全回到原样（这些 TextView 原本没有背景）。
+        view.setBackground(null);
+    }
+
+    /**
+     * 内联错误：设计文档 §9.9 要求错误态有「错误色」。
+     *
+     * <p>不能直接用 {@code ?attr/colorError}：那是跟随调色板的角色，浅色表的深红
+     * （{@code #B3261E}）压在深色壁纸行色带上实测只有 1.06:1，完全不可读。这里用与壁纸
+     * 同族的 {@code ?attr/webhtvColorOnWallpaperError}（同一底材实测 4.05–4.50:1）。
+     *
+     * <p>底材：错误色直接画在行色带上只有 4.05–4.50:1，略低于正文门槛 4.5:1，而继续调色无解
+     * （要达标就得接近纯白，错误色随之失去语义）。因此这里同时换上一块**实心深底**
+     * （{@code @drawable/shape_error_value}），核算为 8.84:1，稳过门槛。
+     *
+     * <p>如实记录：该取值在行色带最亮处是 4.05:1，**略低于正文门槛 4.5:1**。这是底材
+     * （中亮度壁纸）决定的取舍，理由与替代方案见 {@code values/webhtv_tokens.xml} 的同名条目
+     * 与 docs/TV-ERROR-STATE-20261012.md §7。
+     */
+    private void setError(TextView view) {
+        if (view == null) return;
+        view.setText(R.string.error_config_get);
+        view.setTextColor(themeColor(R.attr.webhtvColorOnWallpaperError));
+        view.setBackgroundResource(R.drawable.shape_error_value);
+    }
+
+    /** 解析主题属性里的颜色值；未赋值时返回 0（透明）。 */
+    private int themeColor(int attr) {
+        TypedValue value = new TypedValue();
+        return getTheme().resolveAttribute(attr, value, true) ? value.data : 0;
     }
 
     private void safeRun(String name, Runnable action, Runnable fallback) {
@@ -198,38 +294,49 @@ public class SettingEnhanceActivity extends BaseActivity {
         }
     }
 
-    private void setError(TextView view) {
-        if (view != null) view.setText(R.string.error_config_get);
-    }
-
     private interface TextSupplier {
         CharSequence get();
     }
 
-    private void setFileSites(View view) {
-        SourceBlockDialog.create(this::setText).show(this);
-    }
-
     private void setDriveCheck(View view) {
         Setting.putDriveCheck(!Setting.isDriveCheck());
-        mBinding.driveCheckText.setText(getSwitch(Setting.isDriveCheck()));
+        setSummary(mBinding.driveCheckText, getSwitch(Setting.isDriveCheck()));
     }
 
     private void setDebugLog(View view) {
         Setting.putDebugLog(!Setting.isDebugLog());
-        mBinding.debugLogText.setText(getSwitch(Setting.isDebugLog()));
+        setSummary(mBinding.debugLogText, getSwitch(Setting.isDebugLog()));
         if (!Setting.isDebugLog()) return;
         DebugLogDialog.show(this);
     }
 
+    private void setSiteName(View view) {
+        SiteNameDialog.create(this).onChanged(this::setText).show();
+    }
+
+    private void setAudioSource(View view) {
+        AudioSourceDialog.create(this).onDismiss(this::setText).show();
+    }
+
+    private void setShortDramaSource(View view) {
+        ShortDramaSourceDialog.create(this).onDismiss(this::setText).show();
+    }
+
+    private String getSiteHealthText() {
+        SiteHealthStore.Summary summary = SiteHealthStore.summary();
+        String state = getSwitch(Setting.isSiteHealthSort());
+        if (summary.siteCount <= 0) return state;
+        return state + " · " + getString(R.string.site_health_report_setting_summary, summary.siteCount, summary.sampleCount);
+    }
+
     private void setPlaybackArtworkWall(View view) {
         Setting.putPlaybackArtworkWall(!Setting.isPlaybackArtworkWall());
-        mBinding.playbackArtworkWallText.setText(getSwitch(Setting.isPlaybackArtworkWall()));
+        setSummary(mBinding.playbackArtworkWallText, getSwitch(Setting.isPlaybackArtworkWall()));
     }
 
     private void setWebHomeFullscreen(View view) {
         Setting.putWebHomeFullscreen(!Setting.isWebHomeFullscreen());
-        mBinding.webHomeFullscreenText.setText(getSwitch(Setting.isWebHomeFullscreen()));
+        setSummary(mBinding.webHomeFullscreenText, getSwitch(Setting.isWebHomeFullscreen()));
     }
 
     private void setCspWarmup(View view) {

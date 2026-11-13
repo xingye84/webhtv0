@@ -8,6 +8,7 @@ import com.github.catvod.crawler.diagnostics.DiagnosticLogBuffer;
 import com.github.catvod.crawler.diagnostics.RollingDiagnosticFile;
 import com.github.catvod.crawler.diagnostics.JournaledDiagnosticFile;
 import com.github.catvod.crawler.diagnostics.DiagnosticCategories;
+import com.github.catvod.crawler.diagnostics.DiagnosticText;
 import com.github.catvod.utils.Prefers;
 
 import java.io.ByteArrayInputStream;
@@ -50,14 +51,18 @@ public class DebugLogStore {
             DiagnosticLogBuffer.Limits limits = DiagnosticLogBuffer.Limits.standard();
             buffer = new DiagnosticLogBuffer(limits, new com.github.catvod.crawler.diagnostics.IncidentDiagnosticFile(new JournaledDiagnosticFile(
                     new RollingDiagnosticFile(Init.context().getCacheDir(), limits), Init.context().getFilesDir()), Init.context().getCacheDir()),
-                    new DiagnosticLogBuffer.Clock() {
-                        @Override public long wallMillis() { return System.currentTimeMillis(); }
-                        @Override public long monotonicNanos() { return SystemClock.elapsedRealtimeNanos(); }
-                        @Override public int processId() { return android.os.Process.myPid(); }
-                    });
+                    clock());
             installCrashHandler();
         }
         return buffer;
+    }
+
+    private static DiagnosticLogBuffer.Clock clock() {
+        return new DiagnosticLogBuffer.Clock() {
+            @Override public long wallMillis() { return System.currentTimeMillis(); }
+            @Override public long monotonicNanos() { return SystemClock.elapsedRealtimeNanos(); }
+            @Override public int processId() { return android.os.Process.myPid(); }
+        };
     }
 
     private static void installCrashHandler() {
@@ -120,6 +125,13 @@ public class DebugLogStore {
         DiagnosticLogBuffer current = buffer;
         if (!acceptsTag(tag) || current == null) return;
         current.add(tag, message, critical);
+    }
+
+    /** Capture entry for callers that already cleaned {@code message} for their own log sink. */
+    static void addCleaned(String tag, DiagnosticText.Clean clean, String raw, boolean critical) {
+        DiagnosticLogBuffer current = buffer;
+        if (clean == null || !acceptsTag(tag) || current == null) return;
+        current.addCleaned(tag, clean, raw, critical);
     }
 
     public static void event(DiagnosticEvent event) {
