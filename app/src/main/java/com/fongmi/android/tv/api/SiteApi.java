@@ -19,6 +19,7 @@ import com.fongmi.android.tv.player.Source;
 import com.fongmi.android.tv.server.Server;
 import com.fongmi.android.tv.setting.PlayerSetting;
 import com.fongmi.android.tv.setting.SiteHealthStore;
+import com.fongmi.android.tv.smb.SmbCastSource;
 import com.fongmi.android.tv.utils.PushParser;
 import com.fongmi.android.tv.utils.ResUtil;
 import com.fongmi.android.tv.utils.Sniffer;
@@ -357,7 +358,16 @@ public class SiteApi {
     }
 
     static String resolvePushPlayerUrl(String id) {
-        return Sniffer.pushUrl(PushParser.fromId(id).getUrl());
+        String pushUrl = PushParser.fromId(id).getUrl();
+        // 投屏过来的本地 SMB 源：下发的是 SMB 连接要素描述符，这里由接收端自己启动代理，
+        // 换成本机 127.0.0.1 直链后走和本机 SMB 完全相同的播放路径，不依赖发送端。
+        try {
+            String smb = SmbCastSource.toLocalUrl(pushUrl);
+            if (!TextUtils.isEmpty(smb)) return smb;
+        } catch (Exception e) {
+            SpiderDebug.log("push-smb", "resolve failed=%s", e.getClass().getSimpleName());
+        }
+        return Sniffer.pushUrl(pushUrl);
     }
 
     /**
@@ -365,14 +375,27 @@ public class SiteApi {
      * 报 "WebHome inline VOD not found"；改写成自包含的 push_agent 推送串（真实地址 + 请求头）后再发。
      */
     public static History castHistory(History history, String url, Map<String, String> headers) {
+        return castHistory(history, url, headers, history == null ? "" : history.getVodName());
+    }
+
+    public static History castHistory(History history, String url, Map<String, String> headers, String name) {
         if (history == null || !WebHomeInlineVodStore.KEY.equals(history.getSiteKey())) return history;
         String base = Sniffer.gatewayTarget(url);
         if (TextUtils.isEmpty(base)) base = url;
         if (TextUtils.isEmpty(base)) return history;
         History copy = History.objectFrom(history.toString());
         if (copy == null) return history;
-        copy.setKey(PUSH + AppDatabase.SYMBOL + Sniffer.pushPayload(base, headers) + AppDatabase.SYMBOL + history.getCid());
+        // 发送端的本地截图文件在远端不存在，带过去只会让远端卡片退化成标题首字；
+        // 清掉本地路径，让远端重新用自己设备上的非黑屏截图兜底。
+        copy.setVodPic(clearLocalArtwork(copy.getVodPic()));
+        copy.setWallPic(clearLocalArtwork(copy.getWallPic()));
+        copy.setKey(PUSH + AppDatabase.SYMBOL + Sniffer.pushPayload(base, headers, name) + AppDatabase.SYMBOL + history.getCid());
         return copy;
+    }
+
+    private static String clearLocalArtwork(String pic) {
+        if (TextUtils.isEmpty(pic)) return pic;
+        return pic.startsWith("file://") || pic.startsWith("content://") ? "" : pic;
     }
 
     static boolean isLocalFileUrl(String url) {
@@ -417,9 +440,13 @@ public class SiteApi {
         Vod vod = new Vod();
         vod.setId(id);
         vod.setName(push.getName());
+        // 投屏过来的本地 SMB 源：描述符里带着真实文件名，片名不能显示成一整串描述符；
+        // 地址保持描述符，等播放入口再换成本机代理地址（见 resolvePushPlayerUrl）。
+        boolean smb = SmbCastSource.isDescriptor(push.getUrl());
+        if (smb && !push.hasExplicitTitle()) vod.setName(SmbCastSource.titleOf(push.getUrl()));
         // 本地文件播放/推送到远程 app 时，把 file:/// 转成本机局域网代理地址，
         // 否则远程设备拿到 file:/// 无法访问（会崩）。与 fish 的 buildPushVod 一致。
-        vod.setPlayUrl(push.getUrl().startsWith("file://") ? toLanHttpUrl(push.getUrl()) : push.getUrl());
+        vod.setPlayUrl(!smb && push.getUrl().startsWith("file://") ? toLanHttpUrl(push.getUrl()) : push.getUrl());
         vod.setPlayFrom(ResUtil.getString(R.string.push));
         vod.setPic(ResUtil.getString(R.string.push_image));
         Source.get().parse(vod.setFlags());

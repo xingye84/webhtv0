@@ -1425,7 +1425,7 @@ public class Setting {
     }
 
     public static int getTmdbDetailTheme() {
-        return clampTmdbDetailTheme(Prefers.getInt("tmdb_detail_theme", 2));
+        return clampTmdbDetailTheme(Prefers.getInt("tmdb_detail_theme", 1));
     }
 
     public static void putTmdbDetailTheme(int theme) {
@@ -1823,5 +1823,15 @@ public class Setting {
         } else {
             Prefers.put("download_dir", absPath.trim());
         }
+    }
+
+    // ===== 本地 SMB 播放入口 =====
+    /** 是否显示本地 SMB 播放入口；默认关闭，手机底栏和电视首页菜单共用这个开关。 */
+    public static boolean isSmbEntryEnabled() {
+        return Prefers.getBoolean("smb_entry_enabled", false);
+    }
+
+    public static void putSmbEntryEnabled(boolean enabled) {
+        Prefers.put("smb_entry_enabled", enabled);
     }
 }

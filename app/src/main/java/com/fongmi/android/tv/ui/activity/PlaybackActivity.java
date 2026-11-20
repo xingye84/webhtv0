@@ -499,10 +499,16 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
         return null;
     }
 
-    private void scheduleWebHomeSnapshot() {
+    private boolean needsPlaybackSnapshot(History history) {
+        if (history == null) return false;
+        // 普通站源也参与兜底：详情页没给海报（或跨设备 file:// 已失效）时，
+        // 用当前播放画面的非黑屏截图补历史卡片。
+        return History.isMissingArtwork(history.getVodPic());
+    }
+
+    protected void scheduleWebHomeSnapshot() {
         History history = getPlaybackHistory();
-        if (history == null || !WebHomeInlineVodStore.KEY.equals(history.getSiteKey())) return;
-        if (!TextUtils.isEmpty(history.getVodPic())) return;
+        if (!needsPlaybackSnapshot(history)) return;
         if (TextUtils.equals(history.getKey(), webHomeSnapshotKey)) {
             if (webHomeSnapshotDone || webHomeSnapshotRunning
                     || webHomeSnapshotAttempt >= WEBHOME_SNAPSHOT_DELAYS.length) return;
@@ -524,11 +530,11 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
     private void captureWebHomeSnapshot() {
         if (webHomeSnapshotDone || webHomeSnapshotRunning || isFinishing() || isDestroyed()) return;
         History history = getPlaybackHistory();
-        if (history == null || !WebHomeInlineVodStore.KEY.equals(history.getSiteKey())
-                || !TextUtils.isEmpty(history.getVodPic())) return;
+        if (!needsPlaybackSnapshot(history)) return;
         final String key = history.getKey();
         final int cid = history.getCid();
         final String vodId = history.getVodId();
+        final String siteKey = history.getSiteKey();
         webHomeSnapshotRunning = true;
         PlaybackFrameSnapshot.capture(this, getExoView(), uri -> {
             webHomeSnapshotRunning = false;
@@ -540,20 +546,41 @@ public abstract class PlaybackActivity extends BaseActivity implements MediaCont
                 return;
             }
             webHomeSnapshotDone = true;
-            persistWebHomeSnapshot(cid, key, vodId, uri);
+            persistWebHomeSnapshot(cid, key, vodId, siteKey, uri);
         });
     }
 
     /**
-     * 后台落库：用原子 UPDATE 只在字段仍为空时写入，避免截图期间 TMDB 海报或播放进度被覆盖。
-     * 同时回写内嵌 VOD 存储，之后从历史详情进入也能拿到本地封面。
+     * 后台落库：用原子 UPDATE 只在字段仍为空、仍是 push 占位图或仍是失效的
+     * file:// 路径时写入，避免截图期间 TMDB 海报或播放进度被覆盖。webhome 历史同时回写内嵌 VOD 存储。
      */
-    private void persistWebHomeSnapshot(int cid, String key, String vodId, String uri) {
+    private void persistWebHomeSnapshot(int cid, String key, String vodId, String siteKey, String uri) {
+        final History currentHistory = getPlaybackHistory();
         Task.execute(() -> {
             try {
-                History.updateVodPicIfEmpty(cid, key, uri);
-                WebHomeInlineVodStore.setPic(vodId, uri);
-                App.post(RefreshEvent::history);
+                boolean webhome = WebHomeInlineVodStore.KEY.equals(siteKey);
+                boolean updated = History.updateVodPicIfEmptyOrPlaceholder(cid, key, uri, ResUtil.getString(R.string.push_image));
+                // 首次播放时历史行可能还没插入，原子 UPDATE 会返回 0；此时用当前
+                // 正在播放的历史补插/补写，确保第一张卡片也能拿到截图，而不是等下次播放。
+                if (!updated && currentHistory != null && TextUtils.equals(currentHistory.getKey(), key)) {
+                    History row = History.find(cid, key);
+                    if (row == null) {
+                        History snapshot = currentHistory.copy();
+                        snapshot.setVodPic(uri);
+                        snapshot.save();
+                        updated = true;
+                    } else if (History.isMissingArtwork(row.getVodPic())) {
+                        row.setVodPic(uri);
+                        row.save();
+                        updated = true;
+                    }
+                }
+                if (webhome) WebHomeInlineVodStore.setPic(vodId, uri);
+                if (updated) App.post(() -> {
+                    History current = getPlaybackHistory();
+                    if (current != null && TextUtils.equals(current.getKey(), key)) current.setVodPic(uri);
+                    RefreshEvent.history();
+                });
             } catch (Throwable ignored) {
             }
         });

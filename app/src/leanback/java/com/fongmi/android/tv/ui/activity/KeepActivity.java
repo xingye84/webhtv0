@@ -3,8 +3,11 @@ package com.fongmi.android.tv.ui.activity;
 import android.app.Activity;
 import android.content.Intent;
 import android.os.Bundle;
+import android.view.KeyEvent;
+import android.view.View;
 
 import androidx.recyclerview.widget.GridLayoutManager;
+import androidx.recyclerview.widget.RecyclerView;
 import androidx.viewbinding.ViewBinding;
 
 import com.fongmi.android.tv.Product;
@@ -17,6 +20,8 @@ import com.fongmi.android.tv.event.RefreshEvent;
 import com.fongmi.android.tv.impl.Callback;
 import com.fongmi.android.tv.ui.adapter.KeepAdapter;
 import com.fongmi.android.tv.ui.base.BaseActivity;
+import com.fongmi.android.tv.ui.custom.FocusRestorer;
+import com.fongmi.android.tv.ui.custom.GridRowWrap;
 import com.fongmi.android.tv.ui.custom.SpaceItemDecoration;
 import com.fongmi.android.tv.utils.Notify;
 
@@ -27,6 +32,8 @@ public class KeepActivity extends BaseActivity implements KeepAdapter.OnClickLis
 
     private ActivityKeepBinding mBinding;
     private KeepAdapter mAdapter;
+    private final FocusRestorer mFocusRestorer = new FocusRestorer();
+    private boolean initialFocusDone;
 
     public static void start(Activity activity) {
         activity.startActivity(new Intent(activity, KeepActivity.class));
@@ -42,6 +49,13 @@ public class KeepActivity extends BaseActivity implements KeepAdapter.OnClickLis
         setEmptyContent();
         setRecyclerView();
         getKeep();
+    }
+
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        // 收藏列表和首页分类页一致：行首再按左、行尾再按右都环跳到同一行另一端。
+        if (mAdapter != null && GridRowWrap.handle(mBinding.recycler, Product.getColumn(), event)) return true;
+        return super.dispatchKeyEvent(event);
     }
 
     /**
@@ -76,7 +90,32 @@ public class KeepActivity extends BaseActivity implements KeepAdapter.OnClickLis
     }
 
     private void getKeep() {
-        mAdapter.setItems(Keep.getVod());
+        int position = focusedPosition();
+        Keep focused = position < 0 || position >= mAdapter.getItemCount() ? null : mAdapter.getItem(position);
+        mAdapter.setItems(Keep.getVod(), () -> {
+            if (mAdapter.getItemCount() == 0) {
+                mAdapter.setDelete(false);
+            } else if (focused != null) {
+                restoreFocus(mAdapter.getItems().indexOf(focused) >= 0
+                        ? mAdapter.getItems().indexOf(focused)
+                        : FocusRestorer.nextPosition(position, mAdapter.getItemCount(), Product.getColumn()));
+            } else if (!initialFocusDone) {
+                // 首次进入且收藏非空：焦点交给第一项，不要落在右上角删除按钮。
+                initialFocusDone = true;
+                restoreFocus(0);
+            }
+        });
+    }
+
+    private int focusedPosition() {
+        if (isFinishing() || isDestroyed() || !mBinding.recycler.hasFocus()) return RecyclerView.NO_POSITION;
+        View focus = mBinding.recycler.getFocusedChild();
+        return focus == null ? RecyclerView.NO_POSITION : mBinding.recycler.getChildAdapterPosition(focus);
+    }
+
+    private void restoreFocus(int position) {
+        if (isFinishing() || isDestroyed()) return;
+        mFocusRestorer.restore(mBinding.recycler, position);
     }
 
     private void loadConfig(Config config, Keep item) {

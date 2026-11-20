@@ -86,8 +86,16 @@ public class PlayerSetting {
      * 由 PlayerManager 在建引擎/切引擎时写入，volatile 以便工作线程（取播放地址）读到最新值。
      */
     private static volatile int activePlayer = NONE;
+    /**
+     * 仅本次播放会话生效的内核覆盖，例如 SMB 播放需要临时走 EXO、老容器首次起播临时走 IJK。
+     * 不写回设置里的全局默认内核；用户手动切内核时必须清除，退出对应播放页后也必须清除，
+     * 否则会泄漏到后续普通播放，表现为内核被锁死、切了又回去。
+     */
+    private static volatile int runtimePlayerOverride = NONE;
 
     public static int getPlayer() {
+        int runtimePlayer = runtimePlayerOverride;
+        if (isPlayer(runtimePlayer)) return runtimePlayer;
         int player = Prefers.getInt("player", EXO);
         if (isPlayer(player)) return player;
         putPlayer(EXO);
@@ -96,6 +104,14 @@ public class PlayerSetting {
 
     public static void putPlayer(int player) {
         Prefers.put("player", sanitizePlayer(player));
+    }
+
+    public static void setRuntimePlayerOverride(int player) {
+        runtimePlayerOverride = isPlayer(player) ? sanitizePlayer(player) : NONE;
+    }
+
+    public static void clearRuntimePlayerOverride() {
+        runtimePlayerOverride = NONE;
     }
 
     /**
@@ -199,6 +215,22 @@ public class PlayerSetting {
 
     public static boolean isIjkAvailable() {
         return true;
+    }
+
+    /**
+     * Exo 没有 AVI/WMV/RMVB 等老容器的解复用器，选中 Exo 时这些文件会“有声音没图像”
+     * 或直接解析失败。识别出老容器后，首次播放自动改走带 FFmpeg 的 IJK；
+     * 用户在历史里明确选过内核时不覆盖。
+     */
+    public static boolean isLegacyContainer(String url) {
+        if (url == null) return false;
+        int query = url.indexOf('?');
+        String path = query >= 0 ? url.substring(0, query) : url;
+        String lower = path.toLowerCase(java.util.Locale.ROOT);
+        return lower.endsWith(".avi") || lower.endsWith(".wmv") || lower.endsWith(".asf")
+                || lower.endsWith(".rmvb") || lower.endsWith(".rm") || lower.endsWith(".vob")
+                || lower.endsWith(".flv") || lower.endsWith(".f4v") || lower.endsWith(".mpg")
+                || lower.endsWith(".mpeg") || lower.endsWith(".divx") || lower.endsWith(".xvid");
     }
 
     public static int kernelCount() {

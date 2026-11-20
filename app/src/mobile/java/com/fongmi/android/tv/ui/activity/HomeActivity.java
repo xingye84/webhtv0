@@ -52,6 +52,8 @@ import com.fongmi.android.tv.ui.fragment.SettingPersonalFragment;
 import com.fongmi.android.tv.ui.fragment.SettingPlayerFragment;
 import com.fongmi.android.tv.ui.fragment.SettingSubtitleFragment;
 import com.fongmi.android.tv.ui.fragment.VodFragment;
+import com.fongmi.android.tv.utils.CrashRestartMode;
+import com.fongmi.android.tv.utils.PreviousProcessCrashRecovery;
 import com.fongmi.android.tv.utils.FileChooser;
 import com.fongmi.android.tv.utils.MobileWindow;
 import com.fongmi.android.tv.utils.Notify;
@@ -69,7 +71,7 @@ import java.util.List;
 import org.greenrobot.eventbus.Subscribe;
 import org.greenrobot.eventbus.ThreadMode;
 
-public class HomeActivity extends BaseActivity implements NavigationBarView.OnItemSelectedListener, WebHomeChromeController.Host, VodFragment.ConfigRetry {
+public class HomeActivity extends BaseActivity implements NavigationBarView.OnItemSelectedListener, WebHomeChromeController.Host {
 
     public static final String EXTRA_NAV_POSITION = "nav_position";
     private static final String STATE_RETURN_VOD_FROM_ENHANCE = "returnVodFromEnhance";
@@ -124,7 +126,8 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
     protected void onResume() {
         super.onResume();
         if (mBinding.navigation.getMenu().findItem(R.id.lab).isVisible() != LabConfig.get().getNavEntry()
-                || mBinding.navigation.getMenu().findItem(R.id.following).isVisible() != FollowingSettings.isEnabled()) setNavigation();
+                || mBinding.navigation.getMenu().findItem(R.id.following).isVisible() != FollowingSettings.isEnabled()
+                || mBinding.navigation.getMenu().findItem(R.id.smb).isVisible() != Setting.isSmbEntryEnabled()) setNavigation();
         updateFollowingBadge();
     }
 
@@ -142,6 +145,10 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
     }
 
     private void checkAction(Intent intent) {
+        PreviousProcessCrashRecovery.checkBeforeConfig(this, () -> handleAction(intent));
+    }
+
+    private void handleAction(Intent intent) {
         if (intent.hasExtra(EXTRA_NAV_POSITION)) {
             change(intent.getIntExtra(EXTRA_NAV_POSITION, 0));
             intent.removeExtra(EXTRA_NAV_POSITION);
@@ -188,22 +195,18 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
     }
 
     private void initConfig() {
+        PreviousProcessCrashRecovery.checkBeforeConfig(this, this::loadConfig);
+    }
+
+    private void loadConfig() {
+        if (CrashRestartMode.consume()) {
+            checkAction(getIntent());
+            StateEvent.empty();
+            return;
+        }
         VodConfig.get().config(mStartupConfig == null ? Config.vod() : mStartupConfig).load(getCallback());
         LiveConfig.get().init().load();
         WallConfig.get().init();
-    }
-
-    /**
-     * 首页错误态的重试动作。
-     *
-     * <p>失败的那一步是这里的**内容源配置加载**（{@link #initConfig()}），所以重试必须回到它——
-     * 由 VodFragment 通过 {@link VodFragment.ConfigRetry} 回调过来。重试期间先把状态浮层切回
-     * 加载态，避免错误态一直停在屏幕上。
-     */
-    @Override
-    public void retryConfig() {
-        StateEvent.progress();
-        initConfig();
     }
 
     private Callback getCallback() {
@@ -235,8 +238,8 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
                 resetVodChrome();
                 checkAction(getIntent());
                 runStartupAction();
-                // 失败要发 ERROR（带原因），不能发 EMPTY：消费方对 EMPTY 的处理只是
-                // "隐藏转圈"，于是加载失败后首页是一片空白，用户只看到一个会消失的吐司。
+                // 失败发 ERROR（带原因），不发 EMPTY（EMPTY 现在渲染全屏空态）：消费方收到
+                // ERROR 只收起浮层与转圈、回到原生首页，顶栏与切换内容源照常可用，失败由吐司提示。
                 StateEvent.error(msg);
                 Notify.show(msg);
             }
@@ -282,6 +285,11 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
         mBinding.navigation.getMenu().findItem(R.id.lab).setVisible(LabConfig.get().getNavEntry());
         mBinding.navigation.getMenu().findItem(R.id.live).setVisible(LiveConfig.hasUrl());
         mBinding.navigation.getMenu().findItem(R.id.following).setVisible(FollowingSettings.isEnabled());
+        MenuItem smb = mBinding.navigation.getMenu().findItem(R.id.smb);
+        if (smb != null) {
+            androidx.core.view.MenuItemCompat.setIconTintList(smb, null);
+            smb.setVisible(Setting.isSmbEntryEnabled());
+        }
         updateFollowingBadge();
         syncNavigationSelection();
     }
@@ -336,7 +344,7 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
 
     @Subscribe(threadMode = ThreadMode.MAIN)
     public void onServerEvent(ServerEvent event) {
-        if (event.type() == ServerEvent.Type.PUSH) VideoActivity.push(this, event.text());
+        if (event.type() == ServerEvent.Type.PUSH) VideoActivity.push(this, event.text(), event.name());
         if (event.type() == ServerEvent.Type.SEARCH) SearchActivity.start(this, event.text());
     }
 
@@ -353,6 +361,11 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
         if (item.getItemId() == R.id.live) return openLive();
         if (item.getItemId() == R.id.following) {
             FollowingActivity.start(this, null);
+            return false;
+        }
+        if (item.getItemId() == R.id.smb) {
+            SmbBrowserActivity.start(this);
+            syncNavigationSelection();
             return false;
         }
         return false;
@@ -557,6 +570,7 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
 
     @Override
     protected void onDestroy() {
+        PreviousProcessCrashRecovery.release(this);
         if (mChrome != null) mChrome.destroy();
         LiveConfig.get().clear();
         VodConfig.get().clear("mobile-home-destroy");

@@ -20,6 +20,7 @@ import com.fongmi.android.tv.theme.WebHtvAlertDialogBuilder;
 import com.fongmi.android.tv.ui.adapter.HistoryAdapter;
 import com.fongmi.android.tv.ui.base.BaseActivity;
 import com.fongmi.android.tv.ui.custom.FocusRestorer;
+import com.fongmi.android.tv.ui.custom.GridRowWrap;
 import com.fongmi.android.tv.ui.custom.SpaceItemDecoration;
 import com.fongmi.android.tv.ui.dialog.ViewingReportRangeDialog;
 
@@ -31,6 +32,7 @@ public class HistoryActivity extends BaseActivity implements HistoryAdapter.OnCl
     private ActivityHistoryBinding mBinding;
     private HistoryAdapter mAdapter;
     private final FocusRestorer mFocusRestorer = new FocusRestorer();
+    private boolean initialFocusDone;
 
     public static void start(Activity activity) {
         activity.startActivity(new Intent(activity, HistoryActivity.class));
@@ -66,6 +68,8 @@ public class HistoryActivity extends BaseActivity implements HistoryAdapter.OnCl
    public boolean dispatchKeyEvent(android.view.KeyEvent event) {
        // 与 fish 一致：列表非空时遥控器菜单键直接唤起清空确认。
        if (com.fongmi.android.tv.utils.KeyUtil.isMenuKey(event) && mAdapter != null && mAdapter.getItemCount() > 0) onClear();
+       // 视频列表按到行首/行尾时环跳到同一行另一端，不再卡在边界。
+       if (mAdapter != null && GridRowWrap.handle(mBinding.recycler, Product.getColumn(), event)) return true;
        return super.dispatchKeyEvent(event);
    }
 
@@ -124,8 +128,15 @@ public class HistoryActivity extends BaseActivity implements HistoryAdapter.OnCl
         int position = focusedPosition();
         History focused = position < 0 || position >= mAdapter.getItemCount() ? null : mAdapter.getItem(position);
         mAdapter.setItems(History.getForDisplay(), () -> {
-            if (mAdapter.getItemCount() == 0) mAdapter.setDelete(false);
-            else if (focused != null) restoreFocus(reposition(focused, position));
+            if (mAdapter.getItemCount() == 0) {
+                mAdapter.setDelete(false);
+            } else if (focused != null) {
+                restoreFocus(reposition(focused, position));
+            } else if (!initialFocusDone) {
+                // 首次进入且列表非空：焦点交给第一项，不要落在右上角删除按钮。
+                initialFocusDone = true;
+                restoreFocus(0);
+            }
         });
     }
 

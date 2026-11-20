@@ -1,5 +1,5 @@
 <resources xmlns:xliff="urn:oasis:names:tc:xliff:document:1.2">
-    
+
     <!-- App -->
    <string name="app_name">默影视</string>
    <string name="setting_app_branding">App icon</string>
@@ -273,6 +273,7 @@
     <string name="group_rule_ai_current_interface">Current VOD configuration</string>
 
     <string name="setting_home_vod_auto_load">Auto-load VOD</string>
+    <string name="setting_home_site_lock">Home source lock</string>
     <string name="setting_auto_backup">Automatic backup</string>
     <string name="setting_fullscreen_menu_key">Fullscreen menu key</string>
     <string name="setting_home_menu_key">Home menu key</string>
@@ -1093,7 +1094,9 @@
     <string name="cache_total_limit_title">Total cache limit</string>
     <string name="cache_total_limit_summary">Total limit: %1$s</string>
     <string name="cache_limit_title_exo">Playback cache limit</string>
-    <string name="cache_management_playback_budget">Playback cache %1$s (shrinks to %2$s once playback ends)</string>
+    <string name="cache_management_total_limit">Total limit %1$s (all modules · converges after playback)</string>
+    <string name="cache_management_total_unlimited">Total limit unlimited (all modules · converges after playback)</string>
+    <string name="cache_management_total_blocked">still %1$s over (protected content)</string>
     <string name="cache_cleanup_confirm_title">Clean cache?</string>
     <string name="cache_cleanup_confirm_light">Remove temporary and legacy cache data?</string>
     <string name="cache_cleanup_confirm_standard">Clean rebuildable modules such as images, lyrics, karaoke, and WebHome cache?\n\nFavorites, history, and settings are not affected.</string>
@@ -1120,6 +1123,14 @@
     <string name="cache_module_webhome_raw">WebHome HTTP cache</string>
     <string name="cache_module_epg">EPG programs</string>
     <string name="cache_module_glide">Images and covers</string>
+    <string name="cache_lock_glide">Images</string>
+    <string name="cache_lock_exo">Exo</string>
+    <string name="cache_lock_epg">EPG</string>
+    <string name="cache_lock_logs">Logs</string>
+    <string name="cache_lock_label_closed">🔒 %1$s · locked</string>
+    <string name="cache_lock_label_open">🔓 %1$s · auto</string>
+    <string name="cache_module_auto_locked">%1$s: locked, excluded from automatic cleanup</string>
+    <string name="cache_module_auto_open">%1$s: unlocked, automatic cleanup allowed</string>
     <string name="cache_module_plugin_scripts">JS/Python/Jar resources</string>
     <string name="cache_module_plugin_audit">Plugin audit log</string>
     <string name="cache_module_plugin_http_cache">Plugin network cache</string>
@@ -1149,6 +1160,12 @@
     <string name="about_disclaimer">WebHomeTV is a technical learning and research project based on open source ecosystems. The software itself is completely free and does not provide paid services, video content, live sources, API sources, resource storage, or content distribution.\n\nThis software is only for technical learning, research, and personal testing. Please uninstall it within 24 hours after downloading, installing, or trying it. All behavior and consequences arising from continued use are borne by the user.\n\nThis software does not embed, sell, or distribute any video resources, and is not responsible for interfaces, sources, plugins, scripts, links, cloud-drive resources, or third-party service content added by users. Users must comply with local laws and regulations, respect the rights of copyright owners and content providers, and must not use this software for infringement, piracy, illegal content distribution, or other illegal purposes.\n\nAny individual or organization is strictly prohibited from selling, traffic diversion, paid maintenance, membership services, advertising monetization, box preinstallation, TV box bundle sales, or any other form of profit-making in the name of this software. The project clearly opposes and condemns selling or promoting this software as part of TV boxes, set-top boxes, paid packages, or commercial services.\n\nIf you do not agree with this statement, please stop using and uninstall this software immediately.</string>
     <string name="about_check_update">Check updates</string>
     <string name="about_acknowledge">I understand</string>
+    <string name="about_usage_help">Usage help</string>
+    <string name="usage_help_title">Usage help</string>
+    <string name="usage_help_hint">Tap a module to expand or collapse it. All modules start collapsed.</string>
+    <string name="usage_help_close">Close</string>
+    <string name="usage_help_search">Search help</string>
+    <string name="usage_help_no_result">No matching modules</string>
     <string name="setting_github_proxy">GitHub acceleration sources</string>
     <string name="setting_github_proxy_short">Accelerate</string>
     <string name="setting_github_proxy_hint">Enter a source URL</string>
@@ -1594,6 +1611,9 @@
     <string name="subtitle_realtime_model_deleting">Deleting...</string>
     <string name="subtitle_realtime_model_download_success">Real-time subtitle model downloaded</string>
     <string name="subtitle_realtime_model_download_failed">Model download failed: %1$s</string>
+    <string name="subtitle_realtime_native_download_failed">Speech engine download failed: %1$s</string>
+    <string name="subtitle_realtime_native_checksum_error">Speech engine checksum failed: %1$s</string>
+    <string name="subtitle_realtime_native_load_error">Cannot load speech engine: %1$s</string>
     <string name="subtitle_realtime_model_delete_title">Delete real-time subtitle model</string>
     <string name="subtitle_realtime_model_delete_message">Delete the downloaded model and disable real-time AI subtitles?</string>
     <string name="subtitle_realtime_model_delete_success">Real-time subtitle model deleted</string>
@@ -1907,9 +1927,20 @@
     <!-- Crash -->
     <string name="crash_info">An unexpected error occurred.\nSorry for the inconvenience.</string>
     <string name="crash_restart">Restart app</string>
+    <string name="crash_silent_restart">Silent restart</string>
     <string name="crash_details">Error details</string>
     <string name="crash_details_title">Error details</string>
+    <string name="crash_details_message">App version: %1$s\n\n%2$s</string>
     <string name="crash_details_close">Close</string>
+    <string name="crash_log_title">Log download address</string>
+    <string name="crash_log_hint">Open this address in a browser on a phone or computer on the same network to view and download this crash log.</string>
+    <string name="crash_log_preparing">Preparing the log service…</string>
+    <string name="crash_log_unavailable">Log service unavailable. Use Error details to read the stack trace.</string>
+    <string name="crash_log_no_lan">No LAN address found. Open locally:\n%1$s</string>
+    <string name="crash_log_service_failed">Log service unavailable</string>
+    <string name="crash_log_copy">Copy address</string>
+    <string name="crash_log_copied">Address copied</string>
+    <string name="crash_log_open">Open in browser</string>
 
     <!-- Hint -->
     <string name="copied">Copied</string>
@@ -3113,7 +3144,7 @@
     <string name="plugin_manager_entry_meta">v%1$s · %2$s · %3$s</string>
     <string name="plugin_manager_params">Parameters</string>
     <string name="plugin_manager_params_title">Parameters for %1$s</string>
-    <string name="plugin_manager_params_hint">JSON object, e.g. {&quot;DOUBAN_TOKEN&quot;:&quot;abc&quot;}</string>
+    <string name="plugin_manager_params_hint">JSON object, e.g. {\&quot;DOUBAN_TOKEN\&quot;:\&quot;abc\&quot;}</string>
     <string name="plugin_manager_params_invalid">Parameters must be a JSON object</string>
     <string name="plugin_manager_params_too_large">Parameters are too large to save</string>
     <string name="plugin_manager_remote_import">Import from URL</string>
@@ -3153,6 +3184,7 @@
     <string name="plugin_manager_perm_events">Playback events (plugin.events)</string>
     <string name="plugin_manager_perm_episode_data">Episode data (plugin.data.episode)</string>
     <string name="plugin_panel_title">Plugin panel</string>
+    <string name="crash_action_failed">Action failed. Please try again.</string>
 
     <string name="setting">Config</string>
     <string name="confirm">OK</string>
@@ -3214,4 +3246,34 @@
     <string name="live_epg_yesterday">Yesterday</string>
     <string name="live_epg_tomorrow">Tomorrow</string>
     <string name="live_epg_today">Today</string>
+
+    <!-- Local SMB playback -->
+    <string name="setting_smb_entry">Local SMB playback entry</string>
+    <string name="home_smb">SMB</string>
+    <string name="home_smb_order">Local SMB</string>
+    <string name="smb_browser_title">LAN SMB playback</string>
+    <string name="smb_scan">Scan local network</string>
+    <string name="smb_scanning">Scanning for SMB devices…</string>
+    <string name="smb_no_servers">No SMB devices found. Check that devices are on the same LAN.</string>
+    <string name="smb_auth_title">SMB sign in</string>
+    <string name="smb_username">Username</string>
+    <string name="smb_password">Password</string>
+    <string name="smb_domain">Domain (optional)</string>
+    <string name="smb_login">Connect</string>
+    <string name="smb_auth_failed">Sign-in failed. Check credentials or share permissions.</string>
+    <string name="smb_connect_failed">Could not connect to SMB device</string>
+    <string name="smb_no_shares">No accessible shares found</string>
+    <string name="smb_no_files">This folder is empty</string>
+    <string name="smb_play_video_only">This file type cannot be played</string>
+    <string name="smb_parent">Parent folder</string>
+    <string name="smb_server_count">Found %1$d SMB device(s)</string>
+    <string name="smb_manual_share">Share not listed? Enter its name</string>
+    <string name="smb_share_name">Share name</string>
+    <string name="smb_open_share">Open share</string>
+    <string name="smb_local_network_permission">SMB playback needs local network access. Allow the permission and try again.</string>
+    <string name="smb_save_login">Save sign-in info (fill in next time)</string>
+    <string name="smb_clear_login">Clear saved sign-in info</string>
+    <string name="smb_credentials_saved">Sign-in info saved</string>
+    <string name="smb_credentials_cleared">Saved sign-in info cleared</string>
+    <string name="smb_credentials_save_failed">Could not save sign-in info on this device</string>
 </resources>

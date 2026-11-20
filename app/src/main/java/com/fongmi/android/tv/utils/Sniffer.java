@@ -15,6 +15,7 @@ import com.github.catvod.utils.Trans;
 import com.github.catvod.utils.Util;
 import com.google.common.net.HttpHeaders;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -25,9 +26,14 @@ import java.util.regex.Pattern;
 
 public class Sniffer {
 
-    public static final Pattern CLICKER = Pattern.compile("\\[a=cr:(\\{.*?\\})\\/](.*?)\\[\\/a]");
+    // 单条 [a=cr:{...}/]名[/a] 与多条 [a=cr:[{...},{...}]/]名1/名2[/a] 都算点击标记：
+    // 后者是站源（如 XBPQ）按人逐个下发时用的写法，每条名字对应列表里的一项。
+    public static final Pattern CLICKER = Pattern.compile("\\[a=cr:((?:\\{.*?\\}|\\[.*?\\]))\\/](.*?)\\[\\/a]");
     public static final Pattern AI_PUSH = Pattern.compile("(https?|thunder|magnet|ed2k|video):\\S+");
     public static final Pattern SNIFFER = Pattern.compile("https?://[^\\s]{12,}\\.(?:m3u8|mp4|mkv|flv|mp3|m4a|aac|mpd)(?:\\?.*)?|https?://.*?video/tos[^\\s]*|rtmp:[^\\s]+");
+    // /file 是 WebHTV 本机文件代理，必须按真实后缀判直链；否则 avi/wmv 等会被当成网页，
+    // 走 WebView 嗅探 30 秒后报“播放地址解析失败”。
+    public static final Pattern LOCAL_FILE_VIDEO = Pattern.compile("\\.(?:avi|wmv|asf|rmvb|rm|vob|mpg|mpeg|divx|xvid|f4v|ts|m2ts|3gp|webm|mov)(?:\\?.*)?$", Pattern.CASE_INSENSITIVE);
 
     public static String getUrl(String text) {
         // 携带请求头的推送串：不能走 AI_PUSH 正则，否则 json 里的空格会把地址截断
@@ -62,6 +68,17 @@ public class Sniffer {
         return url + HEADERS_TAG + Uri.encode(App.gson().toJson(headers));
     }
 
+    /**
+     * 投屏历史用的推送串：在地址和请求头之后附带片名，远端拆出标题后可直接显示，
+     * 不需要再按裸地址做 TMDB/搜索匹配。
+     */
+    public static String pushPayload(String url, Map<String, String> headers, String name) {
+        String payload = pushPayload(url, headers);
+        if (TextUtils.isEmpty(name)) return payload;
+        String safeName = name.replace('|', ' ').replace('$', ' ').replace('\n', ' ').replace('\r', ' ').trim();
+        return TextUtils.isEmpty(safeName) ? payload : payload + "|" + safeName;
+    }
+
     /** 取推送串里的请求头（含 @Headers=<json> 与单独的头段）。 */
     public static Map<String, String> pushHeaders(String text) {
         Map<String, String> headers = new LinkedHashMap<>();
@@ -84,7 +101,10 @@ public class Sniffer {
         if (idx < 0) return "";
         String raw = text.substring(idx + tag.length());
         int end = raw.indexOf('@');
-        return end < 0 ? raw : raw.substring(0, end);
+        String value = end < 0 ? raw : raw.substring(0, end);
+        // 投屏推送串会在请求头之后追加 |标题，标题不是 header 内容，解析 header 前先去掉。
+        int title = value.lastIndexOf('|');
+        return title < 0 ? value : value.substring(0, title);
     }
 
     private static void addPushHeader(Map<String, String> headers, String text, String tag, String name) {
@@ -119,8 +139,11 @@ public class Sniffer {
         // 资源网关地址形如 /webResource?url=<encoded>&headers=...，真实地址藏在被编码的 url 参数里
         String inner = gatewayTarget(url);
         if (!TextUtils.isEmpty(inner)) url = inner;
+        // 本地 SMB 代理显式带 smb=1：URL 保留 AVI/WMV 等真实后缀，不再靠补 .mp4 绕过嗅探。
+        if (url.startsWith("http://127.0.0.1:") && url.contains("smb=1")) return true;
         // 推送串带 @Headers= 时同样要剥掉，否则 .m3u8@Headers= 匹配不上
         url = pushUrl(url);
+        if (url.contains("/file/") && LOCAL_FILE_VIDEO.matcher(url).find()) return true;
         Rule rule = getRule(UrlUtil.uri(url));
         for (String exclude : rule.getExclude()) if (url.contains(exclude)) return false;
         for (String exclude : rule.getExclude()) if (Pattern.compile(exclude).matcher(url).find()) return false;
@@ -147,12 +170,59 @@ public class Sniffer {
         int last = 0;
         while (matcher.find()) {
             span.append(text, last, matcher.start());
-            int start = span.length();
-            span.append(Trans.s2t(matcher.group(2).trim()));
-            span.setSpan(factory.apply(Result.type(matcher.group(1))), start, span.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            appendClickable(span, matcher.group(1), matcher.group(2), factory);
             last = matcher.end();
         }
         span.append(text, last, text.length());
         return span;
+    }
+
+    private static void appendClickable(SpannableStringBuilder span, String json, String label, Function<Result, ClickableSpan> factory) {
+        List<String> types = clickItems(json);
+        String value = Trans.s2t(label.trim());
+        int start = span.length();
+        span.append(value);
+        if (types.isEmpty()) return;
+        // 多条链接按"/"拆分名字，与数组顺序一一对应；条数对不上就整段挂第一项，避免拆出半截文本
+        String[] names = types.size() > 1 ? value.split("/") : new String[]{value};
+        if (names.length != types.size()) {
+            span.setSpan(factory.apply(Result.type(types.get(0))), start, span.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            return;
+        }
+        int offset = start;
+        for (int i = 0; i < names.length; i++) {
+            int begin = offset + (i > 0 ? 1 : 0);
+            int end = begin + names[i].length();
+            span.setSpan(factory.apply(Result.type(types.get(i))), begin, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            offset = end;
+        }
+    }
+
+    // {…} 原样返回；[…] 按顶层大括号拆成多条，供逐个名字挂点击
+    public static List<String> clickItems(String json) {
+        List<String> list = new ArrayList<>();
+        if (json == null) return list;
+        String body = json.trim();
+        if (body.isEmpty()) return list;
+        if (!body.startsWith("[")) {
+            list.add(body);
+            return list;
+        }
+        int depth = 0;
+        int start = -1;
+        for (int i = 1; i < body.length(); i++) {
+            char c = body.charAt(i);
+            if (c == '{') {
+                if (depth == 0) start = i;
+                depth++;
+            } else if (c == '}' && depth > 0) {
+                depth--;
+                if (depth == 0 && start >= 0) {
+                    list.add(body.substring(start, i + 1));
+                    start = -1;
+                }
+            }
+        }
+        return list;
     }
 }
