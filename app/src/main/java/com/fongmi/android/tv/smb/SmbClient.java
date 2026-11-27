@@ -36,6 +36,27 @@ public final class SmbClient {
     private SmbClient() {
     }
 
+    /**
+     * host 里允许带端口（{@code 192.168.0.5:4450}）：手机端做共享时绑不了 445，只能退到
+     * 4450 这类高位端口，地址不带端口的话 smbj 会固定连 445。只认最后一段冒号后的数字，
+     * 避免把 IPv6 字面量误切。
+     */
+    private static Connection connect(SMBClient client, String host) throws Exception {
+        if (host == null || host.isEmpty()) throw new IllegalArgumentException("empty host");
+        int cut = host.lastIndexOf(':');
+        if (cut > 0 && cut < host.length() - 1) {
+            String name = host.substring(0, cut);
+            String tail = host.substring(cut + 1);
+            if (tail.chars().allMatch(Character::isDigit)) {
+                int port = Integer.parseInt(tail);
+                if (port > 0 && port <= 65535 && !name.contains(":") && !name.isEmpty()) {
+                    return client.connect(name, port);
+                }
+            }
+        }
+        return client.connect(host);
+    }
+
     private static AuthenticationContext auth(String username, String password, String domain) {
         // 空用户名使用真正的 SMB 匿名会话；部分 NAS 会把 Guest 与 Anonymous 区分处理。
         if (username == null || username.trim().isEmpty()) return AuthenticationContext.anonymous();
@@ -57,7 +78,7 @@ public final class SmbClient {
     public static List<String> listShares(String host, String username, String password, String domain) throws Exception {
         List<String> result = new ArrayList<>();
         try (SMBClient client = new SMBClient();
-             Connection connection = client.connect(host);
+             Connection connection = connect(client, host);
              Session session = authenticate(connection, username, password, domain)) {
             RPCTransport transport = SMBTransportFactories.SRVSVC.getTransport(session);
             ServerService service = new ServerService(transport);
@@ -78,7 +99,7 @@ public final class SmbClient {
                                         String username, String password, String domain) throws Exception {
         List<Entry> result = new ArrayList<>();
         try (SMBClient client = new SMBClient();
-             Connection connection = client.connect(host);
+             Connection connection = connect(client, host);
              Session session = authenticate(connection, username, password, domain)) {
             Share remote = session.connectShare(shareName);
             if (!(remote instanceof DiskShare)) {
@@ -116,7 +137,11 @@ public final class SmbClient {
                 || value.endsWith(".m2ts") || value.endsWith(".wmv") || value.endsWith(".flv")
                 || value.endsWith(".webm") || value.endsWith(".mpg") || value.endsWith(".mpeg")
                 || value.endsWith(".vob") || value.endsWith(".3gp") || value.endsWith(".3g2")
-                || value.endsWith(".mts") || value.endsWith(".mxf") || value.endsWith(".ogv");
+                || value.endsWith(".mts") || value.endsWith(".mxf") || value.endsWith(".ogv")
+                // 只认大写 .DAT：光盘数据区里的 .DAT 是 MPEG-PS 正片（VCD/SVCD 常见，
+                // AVSEQ01.DAT 这类文件名都是大写）；电脑上的纯数据文件一般用小写 .dat，
+                // 不能一起当视频列进目录剧集。这里用原始文件名判大小写，不走上面那个小写串。
+                || name.endsWith(".DAT");
     }
 
     public static boolean isAudio(String name) {
@@ -151,7 +176,7 @@ public final class SmbClient {
         DiskShare share = null;
         com.hierynomus.smbj.share.File file = null;
         try {
-            connection = client.connect(host);
+            connection = connect(client, host);
             session = authenticate(connection, username, password, domain);
             Share remote = session.connectShare(shareName);
             if (!(remote instanceof DiskShare)) throw new IllegalStateException("Not a disk share");
@@ -169,6 +194,176 @@ public final class SmbClient {
             closeQuietly(session);
             closeQuietly(connection);
             closeQuietly(client);
+            throw e;
+        }
+    }
+
+    /**
+     * 播放期的连接池：IJK/Exo 解老容器时会对同一个文件发成百上千次 range 请求，
+     * 每次重新 connect + 认证 + tree connect 比真正读数据还贵。这里按
+     * host+share+凭证 复用一条连接和 share，只把「打开文件」留给调用方。
+     */
+    private static final java.util.Map<String, Pooled> POOL = new java.util.HashMap<>();
+    private static final int MAX_POOL = 4;
+    private static final long POOL_IDLE_MS = 120_000L;
+
+    public static final class SharedFile implements AutoCloseable {
+        private final com.hierynomus.smbj.share.File file;
+        private final long length;
+
+        SharedFile(com.hierynomus.smbj.share.File file, long length) {
+            this.file = file;
+            this.length = length;
+        }
+
+        public long length() {
+            return length;
+        }
+
+        public int read(byte[] buffer, long fileOffset, int offset, int length) {
+            return file.read(buffer, fileOffset, offset, length);
+        }
+
+        @Override
+        public void close() {
+            closeQuietly(file);
+        }
+    }
+
+    private static final class Pooled {
+        final SMBClient client;
+        final Connection connection;
+        final Session session;
+        final DiskShare share;
+        long lastUsed;
+
+        Pooled(SMBClient client, Connection connection, Session session, DiskShare share) {
+            this.client = client;
+            this.connection = connection;
+            this.session = session;
+            this.share = share;
+            this.lastUsed = System.currentTimeMillis();
+        }
+
+        boolean alive(long now) {
+            return now - lastUsed <= POOL_IDLE_MS && connection != null && connection.isConnected();
+        }
+
+        static Pooled create(String host, String shareName,
+                             String username, String password, String domain) throws Exception {
+            SMBClient client = new SMBClient();
+            Connection connection = null;
+            Session session = null;
+            DiskShare share = null;
+            try {
+                connection = connect(client, host);
+                session = authenticate(connection, username, password, domain);
+                Share remote = session.connectShare(shareName);
+                if (!(remote instanceof DiskShare)) {
+                    remote.close();
+                    throw new IllegalStateException("Not a disk share");
+                }
+                share = (DiskShare) remote;
+                return new Pooled(client, connection, session, share);
+            } catch (Exception e) {
+                closeQuietly(share);
+                closeQuietly(session);
+                closeQuietly(connection);
+                closeQuietly(client);
+                throw e;
+            }
+        }
+
+        void close() {
+            closeQuietly(share);
+            closeQuietly(session);
+            closeQuietly(connection);
+            closeQuietly(client);
+        }
+    }
+
+    private static Pooled acquirePooled(String host, String shareName,
+                                        String username, String password, String domain) throws Exception {
+        String key = host + "|" + shareName + "|" + (username == null ? "" : username)
+                + "|" + (password == null ? "" : password) + "|" + (domain == null ? "" : domain);
+        long now = System.currentTimeMillis();
+        synchronized (POOL) {
+            Pooled existing = POOL.get(key);
+            if (existing != null) {
+                if (existing.alive(now)) {
+                    existing.lastUsed = now;
+                    return existing;
+                }
+                POOL.remove(key);
+                existing.close();
+            }
+            while (POOL.size() >= MAX_POOL) {
+                String oldest = null;
+                long oldestUsed = Long.MAX_VALUE;
+                for (java.util.Map.Entry<String, Pooled> item : POOL.entrySet()) {
+                    if (item.getValue().lastUsed < oldestUsed) {
+                        oldestUsed = item.getValue().lastUsed;
+                        oldest = item.getKey();
+                    }
+                }
+                if (oldest == null) break;
+                POOL.remove(oldest).close();
+            }
+            Pooled created = Pooled.create(host, shareName, username, password, domain);
+            POOL.put(key, created);
+            return created;
+        }
+    }
+
+    private static void dropPooled(String host, String shareName,
+                                   String username, String password, String domain) {
+        String key = host + "|" + shareName + "|" + (username == null ? "" : username)
+                + "|" + (password == null ? "" : password) + "|" + (domain == null ? "" : domain);
+        synchronized (POOL) {
+            Pooled removed = POOL.remove(key);
+            if (removed != null) removed.close();
+        }
+    }
+
+    /** 复用池里的连接打开远程文件；只有连接真的断了才丢掉重连一次。 */
+    public static SharedFile openShared(String host, String shareName, String path,
+                                        String username, String password, String domain) throws Exception {
+        try {
+            return openSharedOnce(host, shareName, path, username, password, domain);
+        } catch (Exception e) {
+            // 文件不存在之类的错误不能把池里那条连接一起丢掉：同一场播放/其它流的句柄还挂在上面。
+            if (pooledAlive(host, shareName, username, password, domain)) throw e;
+            dropPooled(host, shareName, username, password, domain);
+            return openSharedOnce(host, shareName, path, username, password, domain);
+        }
+    }
+
+    private static boolean pooledAlive(String host, String shareName,
+                                       String username, String password, String domain) {
+        String key = host + "|" + shareName + "|" + (username == null ? "" : username)
+                + "|" + (password == null ? "" : password) + "|" + (domain == null ? "" : domain);
+        synchronized (POOL) {
+            Pooled pooled = POOL.get(key);
+            return pooled != null && pooled.alive(System.currentTimeMillis());
+        }
+    }
+
+    private static SharedFile openSharedOnce(String host, String shareName, String path,
+                                             String username, String password, String domain) throws Exception {
+        Pooled pooled = acquirePooled(host, shareName, username, password, domain);
+        com.hierynomus.smbj.share.File file = null;
+        try {
+            file = pooled.share.openFile(path,
+                    EnumSet.of(AccessMask.GENERIC_READ),
+                    null,
+                    EnumSet.of(SMB2ShareAccess.FILE_SHARE_READ, SMB2ShareAccess.FILE_SHARE_WRITE, SMB2ShareAccess.FILE_SHARE_DELETE),
+                    SMB2CreateDisposition.FILE_OPEN,
+                    null);
+            long length = file.getFileInformation(FileStandardInformation.class).getEndOfFile();
+            pooled.lastUsed = System.currentTimeMillis();
+            return new SharedFile(file, length);
+        } catch (Exception e) {
+            closeQuietly(file);
             throw e;
         }
     }

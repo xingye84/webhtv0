@@ -895,13 +895,29 @@ public class VideoActivityLayoutTest {
         assertTrue("ending playback must drop the session kernel so the global default applies again", player.contains("PlayerSetting.clearActivePlayer();"));
 
         assertTrue("the per-show kernel must be persisted, not a transient field", history.contains("@SerializedName(\"player\")") && !history.contains("private transient int player"));
+        assertTrue("the remembered kernel must be stored per line, not once per show",
+                history.contains("@SerializedName(\"kernelByFlag\")")
+                        && history.contains("public int getKernelForFlag(String flag)")
+                        && history.contains("public void setKernelForFlag(String flag, int kernel)"));
+        assertTrue("the remembered kernel must stay scoped to the record's own source and the current line",
+                history.contains("public int getPlaybackPlayerOrDefault(String flag)")
+                        && history.contains("if (isCrossSourcePlayback()) return PlayerSetting.getPlayer();"));
+        assertFalse("the legacy whole-show value must not be used as a per-line fallback",
+                history.contains("legacyKernelForFlag"));
+        assertFalse("a playback-failure kernel fallback must never write the kernel memory; PlayerManager "
+                        + "can only do that by holding a History reference, so it must hold none",
+                player.contains("com.fongmi.android.tv.bean.History"));
 
         for (String source : new String[]{leanback, mobile}) {
             assertTrue("playback must restore the show's remembered kernel before resolving the play url",
                     source.contains("player().preparePlayer(kernel);"));
-            assertTrue("the remembered kernel must fall back to the global default", source.contains("mHistory.getPlayerOrDefault()"));
-            assertTrue("the show's history must remember the user's selection, not an engine/session state",
-                    source.contains("private void rememberPlayerKernel(int type)") && source.contains("mHistory.setPlayer(type);"));
+            assertTrue("the kernel must be resolved for the line being started",
+                    source.contains("mHistory.getPlaybackPlayerOrDefault(kernelFlag())"));
+            assertTrue("the show's history must remember the user's selection for that line, not an engine/session state",
+                    source.contains("private void rememberPlayerKernel(String flag, int type)")
+                            && source.contains("mHistory.setKernelForFlag(flag, type);"));
+            assertFalse("the kernel memory must never be written from an engine/session state or for the whole show",
+                    source.contains("mHistory.setPlayer("));
             // 播放页会重叠存在：上一部剧的收尾存档若也写内核，就会用别人的会话内核
             // 覆盖本剧记住的选择，历史回归点。
             assertFalse("routine history saves must not rewrite the show's kernel",
@@ -917,8 +933,11 @@ public class VideoActivityLayoutTest {
                 tmdb.contains("SiteApi.playerContent(key, flag, episodeUrl, playerKernel)"));
         assertTrue("inline TMDB playback must restore the show's remembered kernel",
                 tmdb.contains("player().preparePlayer(inlineHistoryPlayerKernel());"));
-        assertTrue("inline TMDB playback must remember only the user's selection",
-                tmdb.contains("private void rememberInlinePlayerKernel(int type)") && tmdb.contains("history.setPlayer(type);"));
+        assertTrue("inline TMDB playback must scope the remembered kernel to the current line",
+                tmdb.contains("history.getPlaybackPlayerOrDefault(inlineKernelFlag())"));
+        assertTrue("inline TMDB playback must remember only the user's selection, for that line",
+                tmdb.contains("private void rememberInlinePlayerKernel(int type)")
+                        && tmdb.contains("history.setKernelForFlag(inlineKernelFlag(), type);"));
         assertFalse("inline progress sync must not rewrite the show's kernel",
                 tmdb.contains("history.setPlayer(PlayerSetting.getActivePlayer());"));
     }
@@ -982,38 +1001,23 @@ public class VideoActivityLayoutTest {
     }
 
     @Test
-    public void mobileShortDramaKeepsStandardSettingButtonVisible() throws Exception {
+    public void mobileShortDramaUsesSameControlBarAsNormalFullscreen() throws Exception {
+        // 短剧不再另做一套控制栏：竖屏全屏、横屏全屏、电视端给的都是同一排 action 按钮
+        //（EXO/解码/比例/音轨/字幕/倍速/片头片尾/换源/画质/选集…）。
+        // 片头片尾也在这排里，短剧时长再短也能手动设，不需要额外的三个 dock 图标入口，
+        // 也就不会出现「只有图标、倍速/刷新/换内核都摸不到」的情况。
         Path sourcePath = findMobileJavaPath().resolve(Path.of("com", "fongmi", "android", "tv", "ui", "activity", "VideoActivity.java"));
         String source = new String(Files.readAllBytes(sourcePath), StandardCharsets.UTF_8);
-        int showControl = source.indexOf("private void showControl()");
-        int shortDrama = source.indexOf("boolean shortDrama = isShortDramaSource();", showControl);
-        int setting = source.indexOf("mBinding.control.setting.setVisibility(mHistory == null || (isFullscreen() && !shortDrama) ? View.GONE : View.VISIBLE);", shortDrama);
-        int shortDramaViews = source.indexOf("private View[] getShortDramaControlViews()");
-        int dockedSetting = source.indexOf("mBinding.control.setting,", shortDramaViews);
 
-        assertTrue(sourcePath + " is missing showControl", showControl >= 0);
-        assertTrue("short drama mode must keep the standard setting button visible while fullscreen", setting > shortDrama);
-        assertTrue("short drama floating controls must include the standard setting button", dockedSetting > shortDramaViews);
-    }
-
-    @Test
-    public void mobileShortDramaDocksChangeSourceAndQuality() throws Exception {
-        // 反馈回归：短剧模式把整条 action 栏 GONE 掉，换源与画质只有搬进 dock 才可达，
-        // 否则短剧只能在选集里换线路(flag)，无法换站点、无法切画质。
-        Path sourcePath = findMobileJavaPath().resolve(Path.of("com", "fongmi", "android", "tv", "ui", "activity", "VideoActivity.java"));
-        String source = new String(Files.readAllBytes(sourcePath), StandardCharsets.UTF_8);
-        int views = source.indexOf("private View[] getShortDramaControlViews()");
-        assertTrue("getShortDramaControlViews must exist", views >= 0);
-        String body = source.substring(views, source.indexOf("\n    }", views));
-        // dock 里全是 48dp 图标，换源/画质/选集必须用专用 ImageView 入口，
-        // 不能直接搬 action 栏的 MaterialTextView，否则文字按钮与图标混排（见用户反馈截图）。
-        assertTrue("short drama dock must expose the change-source icon",
-                body.contains("mBinding.control.shortDramaChangeSource,"));
-        assertTrue("short drama dock must expose the quality icon",
-                body.contains("mBinding.control.shortDramaQuality,"));
-        assertFalse("short drama dock must not mix in action-bar text buttons",
-                body.contains("mBinding.control.action."));
-
+        String showControl = methodBody(source, "private void showControl()", "private boolean canShowPiP");
+        assertTrue("fullscreen must always show the action bar, portrait and short drama included",
+                showControl.contains("mBinding.control.action.getRoot().setVisibility(isFullscreen() || isFusionPlayerActionsDocked() ? View.VISIBLE : View.GONE);"));
+        assertFalse("short drama must not hide the action bar again after showControl sets it",
+                showControl.contains("syncShortDramaControlLayout("));
+        assertFalse("short drama must not relocate controls into a side dock",
+                source.contains("dockShortDramaControls()"));
+        assertFalse("the short-drama-only icon entries are gone",
+                source.contains("mBinding.control.shortDramaChangeSource"));
     }
 
     @Test
@@ -1135,46 +1139,6 @@ public class VideoActivityLayoutTest {
         int resync = exitBody.indexOf("resetInlineShortDramaMode();");
         assertTrue("leaving inline fullscreen must resync the gesture axes after clearing the flag",
                 cleared >= 0 && resync > cleared);
-    }
-
-    @Test
-    public void mobileShortDramaQualityIconHasSingleSourceOfTruth() throws Exception {
-        // setQualityVisible 有 6 个调用点，其中多处显式传 false（未选中集数、切线路重置），
-        // 与 Result.isMulti() 的结论并不一致。dock 图标若自行推导 Result，就会与 action 栏
-        // 按钮状态相反。两者必须共用 setQualityVisible 记下的同一个结论。
-        Path sourcePath = findMobileJavaPath().resolve(Path.of("com", "fongmi", "android", "tv", "ui", "activity", "VideoActivity.java"));
-        String source = new String(Files.readAllBytes(sourcePath), StandardCharsets.UTF_8);
-
-        String setter = methodBody(source, "private void setQualityVisible(boolean visible)", "private void updateActionQuality");
-        assertTrue("setQualityVisible must record its verdict for the dock icon to reuse",
-                setter.contains("mQualityVisible = visible;"));
-
-        String sync = methodBody(source, "private void syncShortDramaControlLayout(boolean shortDrama)", "private void dockShortDramaControls");
-        assertTrue("the docked quality icon must reuse the recorded verdict",
-                sync.contains("mBinding.control.shortDramaQuality.setVisibility(mQualityVisible ? View.VISIBLE : View.GONE);"));
-        // 注释里会提到 isMulti() 来解释为何不用它，所以先剥掉注释再断言
-        String syncCode = sync.replaceAll("(?m)//.*$", "");
-        assertFalse("the docked quality icon must not re-derive visibility from the player Result",
-                syncCode.contains("isMulti()") || syncCode.contains("isQualityAvailable()"));
-    }
-
-    @Test
-    public void mobileShortDramaRestoreIsIndependentOfDeclarationOrder() throws Exception {
-        // 同一容器现在有多个搬迁项（cast/keep/换源/画质/选集/设置同属顶部栏）。逐个「摘下并立刻插回」
-        // 会让后来者挤掉前者的位置，且 PlayerButtonSetting.applyOrder 可能已重排容器，
-        // 声明顺序不等于索引升序。还原必须先全部摘下、再按原始索引升序插回。
-        Path sourcePath = findMobileJavaPath().resolve(Path.of("com", "fongmi", "android", "tv", "ui", "activity", "VideoActivity.java"));
-        String source = new String(Files.readAllBytes(sourcePath), StandardCharsets.UTF_8);
-        int restore = source.indexOf("private void restoreShortDramaControls()");
-        assertTrue("restoreShortDramaControls must exist", restore >= 0);
-        String body = source.substring(restore, source.indexOf("\n    }", restore));
-
-        int detachLoop = body.indexOf("parent.removeView(item.view);");
-        int sort = body.indexOf("items.sort(Comparator.comparingInt(item -> item.index));");
-        int attachLoop = body.indexOf("item.parent.addView(item.view,");
-        assertTrue("restore must detach every docked view before re-attaching", detachLoop >= 0);
-        assertTrue("restore must re-attach in ascending original index order", sort > detachLoop);
-        assertTrue("restore must re-attach after sorting", attachLoop > sort);
     }
 
     @Test
@@ -1319,43 +1283,47 @@ public class VideoActivityLayoutTest {
     }
 
     @Test
-    public void mobileReadyStateKeepsPlaybackInitializationAfterPendingResumeSeek() throws Exception {
+    public void mobileReadyStateKeepsPlaybackInitializationWithoutResumeSeekRetry() throws Exception {
         Path sourcePath = findMobileJavaPath().resolve(Path.of("com", "fongmi", "android", "tv", "ui", "activity", "VideoActivity.java"));
         String source = new String(Files.readAllBytes(sourcePath), StandardCharsets.UTF_8);
         int method = source.indexOf("protected void onStateChanged(int state)");
         int ready = source.indexOf("case Player.STATE_READY:", method);
-        int seek = source.indexOf("boolean pendingResumeSeekApplied = applyPendingResumeSeek();", ready);
         int reset = source.indexOf("player().reset();", ready);
         int shortDrama = source.indexOf("applyShortDramaMode();", ready);
         int introSkip = source.indexOf("requestIntroSkipPlan();", ready);
-        int autoSkipGuard = source.indexOf("if (!pendingResumeSeekApplied) applyAutoIntroSkip();", ready);
+        int autoSkip = source.indexOf("applyAutoIntroSkip();", ready);
 
         assertTrue(sourcePath + " is missing onStateChanged", method >= 0);
-        assertTrue("ready playback must capture whether a pending resume seek was applied", seek > ready);
-        assertTrue("pending resume seek must not skip playback reset", reset > seek);
-        assertTrue("pending resume seek must not skip short-drama readiness", shortDrama > reset);
-        assertTrue("pending resume seek must not skip intro-skip planning", introSkip > shortDrama);
-        assertTrue("auto intro skip should wait for the deferred seek to settle", autoSkipGuard > introSkip);
+        assertTrue("ready playback must keep playback reset", reset > ready);
+        assertTrue("ready playback must keep short-drama readiness", shortDrama > reset);
+        assertTrue("ready playback must keep intro-skip planning", introSkip > shortDrama);
+        assertTrue("auto intro skip must run directly instead of being gated by a resume-seek retry", autoSkip > introSkip);
+        // 起播位置只交给播放器一次：READY 之后不再补跳、不再定时复核。
+        assertFalse("resume seek must not be retried after ready", source.contains("applyPendingResumeSeek"));
+        assertFalse("startup position must not be duplicated in a second field", source.contains("pendingResumeSeekMs"));
+        assertFalse("startup position must not be duplicated in an attempt counter", source.contains("resumeSeekAttempts"));
     }
 
     @Test
-    public void leanbackReadyStateKeepsPlaybackInitializationAfterPendingResumeSeek() throws Exception {
+    public void leanbackReadyStateKeepsPlaybackInitializationWithoutResumeSeekRetry() throws Exception {
         Path sourcePath = findLeanbackJavaPath().resolve(Path.of("com", "fongmi", "android", "tv", "ui", "activity", "VideoActivity.java"));
         String source = new String(Files.readAllBytes(sourcePath), StandardCharsets.UTF_8);
         int method = source.indexOf("protected void onStateChanged(int state)");
         int ready = source.indexOf("case Player.STATE_READY:", method);
-        int seek = source.indexOf("boolean pendingResumeSeekApplied = applyPendingResumeSeek();", ready);
         int reset = source.indexOf("player().reset();", ready);
         int shortDrama = source.indexOf("applyShortDramaMode();", ready);
         int introSkip = source.indexOf("requestIntroSkipPlan();", ready);
-        int autoSkipGuard = source.indexOf("if (!pendingResumeSeekApplied) applyAutoIntroSkip();", ready);
+        int autoSkip = source.indexOf("applyAutoIntroSkip();", ready);
 
         assertTrue(sourcePath + " is missing onStateChanged", method >= 0);
-        assertTrue("TV ready playback must capture whether a pending resume seek was applied", seek > ready);
-        assertTrue("TV pending resume seek must not skip playback reset", reset > seek);
-        assertTrue("TV pending resume seek must not skip short-drama readiness", shortDrama > reset);
-        assertTrue("TV pending resume seek must not skip intro-skip planning", introSkip > shortDrama);
-        assertTrue("TV auto intro skip should wait for the deferred seek to settle", autoSkipGuard > introSkip);
+        assertTrue("TV ready playback must keep playback reset", reset > ready);
+        assertTrue("TV ready playback must keep short-drama readiness", shortDrama > reset);
+        assertTrue("TV ready playback must keep intro-skip planning", introSkip > shortDrama);
+        assertTrue("TV auto intro skip must run directly instead of being gated by a resume-seek retry", autoSkip > introSkip);
+        // 起播位置只交给播放器一次：READY 之后不再补跳、不再定时复核。
+        assertFalse("resume seek must not be retried after ready", source.contains("applyPendingResumeSeek"));
+        assertFalse("startup position must not be duplicated in a second field", source.contains("pendingResumeSeekMs"));
+        assertFalse("startup position must not be duplicated in an attempt counter", source.contains("resumeSeekAttempts"));
     }
 
     @Test
@@ -3002,7 +2970,7 @@ public class VideoActivityLayoutTest {
             int alignMethod = source.indexOf("private void alignHistoryWithSelectedEpisode", resumeMethod);
             String resumeBody = resumeMethod >= 0 && alignMethod > resumeMethod ? source.substring(resumeMethod, alignMethod) : "";
             int setPosition = resumeBody.indexOf("setPosition();");
-            int applyPending = resumeBody.indexOf("applyPendingResumeSeek();");
+            int applyPending = resumeBody.indexOf("seekToResumePosition(position);");
             assertTrue(sourcePath + " must protect the cross-source position while switching playback",
                     source.contains("private boolean tmdbHistoryResumePending;")
                             && source.contains("tmdbHistoryResumePending = true;")
@@ -3019,7 +2987,7 @@ public class VideoActivityLayoutTest {
             assertTrue(sourcePath + " must not write the old player position into the resumed episode cache during refresh",
                     saveCacheGuard >= 0 && saveCacheWrite > saveCacheGuard);
 
-            assertTrue(sourcePath + " must immediately apply a pending IJK seek when the selected episode is unchanged",
+            assertTrue(sourcePath + " must seek to the resolved history position when the selected episode is unchanged",
                     setPosition >= 0 && applyPending > setPosition);
 
             int manual = source.indexOf("private void applyManualTmdb(TmdbItem item)");

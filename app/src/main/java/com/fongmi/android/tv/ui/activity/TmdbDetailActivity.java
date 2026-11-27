@@ -690,10 +690,8 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
             startDirectFromHistory(activity, key, id, name, pic, mark, playFlag, playFlagKey, playEpisodeName, playEpisodeUrl, resumeHistory);
             return;
         }
-        if (!TextUtils.isEmpty(key) && !SiteApi.PUSH.equals(key) && isShortDramaSiteEnabled(key)) {
-            startDirectFromHistory(activity, key, id, name, pic, mark, playFlag, playFlagKey, playEpisodeName, playEpisodeUrl, resumeHistory);
-            return;
-        }
+        // 短剧源曾经在这里直接走直放页（跳详情）。直放页没有详情可返回，点开就全屏、返回直接退出，
+        // 而且竖屏形态会把横屏素材也转成竖屏。现在短剧源和普通站源一样先进详情。
         if (!TextUtils.isEmpty(key) && !SiteApi.PUSH.equals(key) && !TmdbSitePolicy.isEnabled(key, id)) {
             startDirectFromHistory(activity, key, id, name, pic, mark, playFlag, playFlagKey, playEpisodeName, playEpisodeUrl, resumeHistory);
             return;
@@ -2894,6 +2892,8 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
         if (requested != null) return requested;
         String requestedName = getIntentPlaybackEpisodeName();
         for (Episode item : episodes) if (!TextUtils.isEmpty(requestedName) && (TextUtils.equals(requestedName, item.getName()) || TextUtils.equals(requestedName, item.getDisplayName()))) return item;
+        Episode folderEpisode = findFolderPlaybackEpisode(episodes);
+        if (folderEpisode != null) return folderEpisode;
         try {
             History saved = isResumeFromHistory() ? getIntentResumeHistory() : null;
             if (saved == null && !isResumeFromHistory()) saved = History.findPlayback(getHistoryKey(), List.of(loadedVod.getName(), getNameText()), loadedVod.getFlags(), null, sourceTitleSeasonNumber());
@@ -3058,8 +3058,11 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
 
     private void fallbackToOriginalDetail(Vod loadedVod, String reason) {
         if (isFinishing() || isDestroyed()) return;
-        SpiderDebug.log("tmdb-detail-flow", "fallback direct reason=%s key=%s id=%s", reason, getKeyText(), getIdText());
-        VideoActivity.startDirectResolved(this, loadedVod);
+        SpiderDebug.log("tmdb-detail-flow", "fallback native detail reason=%s key=%s id=%s", reason, getKeyText(), getIdText());
+        // 站源没有 TMDB 数据时不能交给「直放」页：直放只播不展示详情，用户点开后直接全屏，
+        // 返回还会因为没有详情可退回而直接退出。这里回落到原生详情页，详情先上屏，播放从详情里发起。
+        VideoActivity.start(this, getKeyText(), getIdText(), loadedVod.getName(), loadedVod.getPic(),
+                loadedVod.getRemarks(), null, loadedVod.getContent());
         finish();
     }
 
@@ -8454,12 +8457,12 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
         binding.playerInfo.setVisibility(View.GONE); // 始终隐藏信息按钮
         binding.playerActionRow.setVisibility(View.VISIBLE);
         binding.playerDanmakuToggle.setVisibility(View.GONE);
-        binding.playerEpisodes.setVisibility(episodeCount < 2 ? View.GONE : View.VISIBLE);
-        binding.playerQuality.setVisibility(inlineQuality ? View.VISIBLE : View.GONE);
-        binding.playerVideoTrack.setVisibility(hasPlayer && player().haveTrack(C.TRACK_TYPE_VIDEO) ? View.VISIBLE : View.GONE);
-        binding.playerParse.setVisibility(useParse && !VodConfig.get().getParses().isEmpty() ? View.VISIBLE : View.GONE);
-        binding.playerDanmaku.setVisibility(hasPlayer && inlineControlController.hasDanmakuControl() ? View.VISIBLE : View.GONE);
-        binding.playerAdFeedback.setVisibility(inlineAdFeedback ? View.VISIBLE : View.GONE);
+        PlayerButtonSetting.apply(binding.playerEpisodes, PlayerButtonSetting.EPISODES, episodeCount >= 2);
+        PlayerButtonSetting.apply(binding.playerQuality, PlayerButtonSetting.QUALITY, inlineQuality);
+        PlayerButtonSetting.apply(binding.playerVideoTrack, PlayerButtonSetting.VIDEO, hasPlayer && player().haveTrack(C.TRACK_TYPE_VIDEO));
+        PlayerButtonSetting.apply(binding.playerParse, PlayerButtonSetting.PARSE, useParse && !VodConfig.get().getParses().isEmpty());
+        PlayerButtonSetting.apply(binding.playerDanmaku, PlayerButtonSetting.DANMAKU, hasPlayer && inlineControlController.hasDanmakuControl());
+        PlayerButtonSetting.apply(binding.playerAdFeedback, PlayerButtonSetting.AD_FEEDBACK, inlineAdFeedback);
         binding.playerChapter.setVisibility(View.GONE); // 始终隐藏信息按钮
         binding.playerRepeat.setSelected(hasPlayer && player().isRepeatOne());
         binding.playerPlayParams.setSelected(hasPlayer && inlineOsd != null && inlineOsd.isDiagnosticsVisible());
@@ -9704,6 +9707,8 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
 
     private void updateInlineOpeningEndingText() {
         if (binding == null) return;
+        // 屏显左下角的总时长跟着扣掉手设的片尾；没设/不匹配时传 0，照真实片长显示。
+        if (inlineOsd != null && history != null) inlineOsd.setEnding(history.getEnding());
         binding.playerOpening.setText(inlineOpeningLabel());
         binding.playerEnding.setText(inlineEndingLabel());
         if (!Util.isMobile() || detailActionRoot == null) return;
@@ -11072,7 +11077,31 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
     }
 
     private void checkInlineEnded(boolean notify) {
+        // 先归零本集进度再切下一集：顺序反了之后 history 已经是下一集。
+        resetInlineFinishedProgress();
         checkInlineNext(notify);
+    }
+
+    /**
+     * 本集播完（自然结束或快进越过片尾）时清掉这一集的进度。
+     *
+     * <p>位置缓存留着「已越过片尾」的位置时，切回上一集会一开播就又满足片尾判据、
+     * 立刻自动跳下一集，只能删历史才能再进去。只在有多集可切时处理。
+     */
+    private void resetInlineFinishedProgress() {
+        if (history == null || selectedFlag == null) return;
+        if (selectedFlag.getEpisodes().size() < 2) return;
+        String cacheKey = currentInlineHistoryCacheKey();
+        if (!TextUtils.isEmpty(cacheKey) && !skipEpisodePositionCache()) {
+            EpisodePositionCache.get().put(getKeyText(), getIdText(), selectedFlag.getFlag(), cacheKey, 0, history.getDuration());
+            Task.execute(() -> EpisodePositionCache.get().save());
+        }
+        history.setPosition(0);
+        if (!Setting.isIncognito() && history.canSave()) {
+            History snapshot = history.copy();
+            Task.execute(snapshot::save);
+        }
+        if (SpiderDebug.isEnabled()) SpiderDebug.log("playback-ending", "action=reset-inline episode=%s", cacheKey);
     }
 
     private MediaMetadata buildMetadata() {
@@ -12027,12 +12056,17 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
      */
     private void rememberInlinePlayerKernel(int type) {
         if (history == null || !PlayerSetting.isPlayer(type)) return;
-        history.setPlayer(type);
+        history.setKernelForFlag(inlineKernelFlag(), type);
     }
 
-    /** 本剧记住的内核；没有记录时退回设置页的全局默认。 */
+    /** 本剧当前线路记住的内核；该线路没有记录、或记录是跨源聚合来的，退回设置页的全局默认。 */
     private int inlineHistoryPlayerKernel() {
-        return history == null ? PlayerSetting.getPlayer() : history.getPlayerOrDefault();
+        return history == null ? PlayerSetting.getPlayer() : history.getPlaybackPlayerOrDefault(inlineKernelFlag());
+    }
+
+    /** 内联播放当前线路名：内核记忆按线路存，读写都必须带它。 */
+    private String inlineKernelFlag() {
+        return selectedFlag == null ? "" : selectedFlag.getFlag();
     }
 
     private void requestIntroSkipPlan() {
@@ -13751,7 +13785,22 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
         if (TextUtils.isEmpty(requestedFlagKey) && !TextUtils.isEmpty(requestedFlag)
                 && !TextUtils.equals(requestedFlag, flag.getFlag())) return null;
         String requestedName = getIntentPlaybackEpisodeName();
-        return TextUtils.isEmpty(requestedName) ? null : flag.find(requestedName, false);
+        return TextUtils.isEmpty(requestedName) ? findFolderPlaybackEpisode(flag.getEpisodes()) : flag.find(requestedName, false);
+    }
+
+    private Episode findFolderPlaybackEpisode(List<Episode> episodes) {
+        String mark = getMarkText();
+        if (isResumeFromHistory() || TextUtils.isEmpty(mark)
+                || !TextUtils.isEmpty(getIntentPlaybackFlag()) || !TextUtils.isEmpty(getIntentPlaybackFlagKey())
+                || !TextUtils.isEmpty(getIntentPlaybackEpisodeName()) || !TextUtils.isEmpty(getIntentPlaybackEpisodeUrl())) return null;
+        // 普通备注不是选集请求；同名不同 URL 也不能仅凭文件名确定版本。
+        Episode matched = null;
+        for (Episode episode : episodes) {
+            if (!mark.equalsIgnoreCase(episode.getName())) continue;
+            if (matched != null && !TextUtils.equals(matched.getUrl(), episode.getUrl())) return null;
+            matched = episode;
+        }
+        return matched;
     }
 
     private MaterialButton createChipButton(String text) {

@@ -5,6 +5,7 @@ import android.graphics.Bitmap;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.TextUtils;
 import android.view.PixelCopy;
 import android.view.SurfaceView;
 import android.view.TextureView;
@@ -18,7 +19,10 @@ import com.fongmi.android.tv.App;
 import com.fongmi.android.tv.utils.Task;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
 
 /**
  * 从当前播放视图抓一帧，作为历史缺失海报（推送占位/普通站源空图）时的兜底封面。
@@ -42,14 +46,40 @@ public final class PlaybackFrameSnapshot {
         void onCaptured(@NonNull String uri);
     }
 
+    public interface BitmapCallback {
+        /** 成功返回非黑屏的一帧（调用方负责回收），失败返回 null；回调在主线程。 */
+        void onCaptured(@Nullable Bitmap bitmap);
+    }
+
     public static void capture(@NonNull Activity activity, @Nullable PlayerView playerView, @NonNull Callback callback) {
+        captureBitmap(activity, playerView, bitmap -> {
+            if (bitmap == null) {
+                callback.onCaptured("");
+                return;
+            }
+            Task.execute(() -> {
+                String uri = "";
+                try {
+                    uri = save(activity, bitmap);
+                } catch (Throwable ignored) {
+                } finally {
+                    bitmap.recycle();
+                }
+                final String result = uri;
+                App.post(() -> callback.onCaptured(result));
+            });
+        });
+    }
+
+    /** 只取一帧交回调用方，落盘方式由调用方决定（SMB 缩略图就走这里）。 */
+    public static void captureBitmap(@NonNull Activity activity, @Nullable PlayerView playerView, @NonNull BitmapCallback callback) {
         if (playerView == null) {
-            callback.onCaptured("");
+            callback.onCaptured(null);
             return;
         }
         View surface = playerView.getVideoSurfaceView();
         if (!playerView.isAttachedToWindow() || surface == null || surface.getWidth() <= 0 || surface.getHeight() <= 0) {
-            callback.onCaptured("");
+            callback.onCaptured(null);
             return;
         }
         int[] size = targetSize(surface.getWidth(), surface.getHeight());
@@ -57,10 +87,10 @@ public final class PlaybackFrameSnapshot {
         if (surface instanceof SurfaceView surfaceView) {
             Bitmap bitmap = Bitmap.createBitmap(size[0], size[1], Bitmap.Config.ARGB_8888);
             try {
-                PixelCopy.request(surfaceView, bitmap, result -> finish(activity, bitmap, result == PixelCopy.SUCCESS, callback), handler);
+                PixelCopy.request(surfaceView, bitmap, result -> finishBitmap(bitmap, result == PixelCopy.SUCCESS, callback), handler);
             } catch (RuntimeException error) {
                 bitmap.recycle();
-                callback.onCaptured("");
+                callback.onCaptured(null);
             }
             return;
         }
@@ -70,29 +100,19 @@ public final class PlaybackFrameSnapshot {
                 bitmap = textureView.getBitmap(size[0], size[1]);
             } catch (RuntimeException ignored) {
             }
-            finish(activity, bitmap, bitmap != null, callback);
+            finishBitmap(bitmap, bitmap != null, callback);
             return;
         }
-        callback.onCaptured("");
+        callback.onCaptured(null);
     }
 
-    private static void finish(Activity activity, Bitmap bitmap, boolean success, Callback callback) {
+    private static void finishBitmap(Bitmap bitmap, boolean success, BitmapCallback callback) {
         if (!success || bitmap == null || isMostlyBlack(bitmap)) {
             if (bitmap != null) bitmap.recycle();
-            callback.onCaptured("");
+            callback.onCaptured(null);
             return;
         }
-        Task.execute(() -> {
-            String uri = "";
-            try {
-                uri = save(activity, bitmap);
-            } catch (Throwable ignored) {
-            } finally {
-                bitmap.recycle();
-            }
-            final String result = uri;
-            App.post(() -> callback.onCaptured(result));
-        });
+        callback.onCaptured(bitmap);
     }
 
     private static boolean isMostlyBlack(Bitmap bitmap) {
@@ -125,6 +145,45 @@ public final class PlaybackFrameSnapshot {
             }
         }
         return Uri.fromFile(file).toString();
+    }
+
+    /**
+     * 播放画面抓不到（网页源叠层、黑屏、还没出图）时，改从片源直接抽一帧封面。
+     * 走 ffmpeg 关键帧抽取，HLS / 老容器也能拿到图；失败返回空串。
+     */
+    public static String captureFromSource(Activity activity, String media, java.util.Map<String, String> headers) {
+        if (activity == null || TextUtils.isEmpty(media)) return "";
+        File directory = new File(activity.getFilesDir(), "webhome_snapshot");
+        if (!directory.exists() && !directory.mkdirs()) return "";
+        File file = new File(directory, "snapshot-" + System.currentTimeMillis() + "-" + System.nanoTime() + ".jpg");
+        if (!TrickplayStore.saveCover(activity.getApplicationContext(), media, headers, file)) {
+            file.delete();
+            return "";
+        }
+        return Uri.fromFile(file).toString();
+    }
+
+    /**
+     * 把已经抽好的图片复制进历史封面目录，返回 {@code file://} URI。
+     *
+     * <p>不直接引用原文件：缩略图缓存有容量上限和过期清理，历史封面若指着缓存目录，
+     * 清一次缓存历史图就集体失效。复制一份到 {@code webhome_snapshot}，生命周期就和其他
+     * 截图一致（删历史/清空历史时一起删），也不会反过来影响目录预览用的缓存。
+     */
+    public static String importArtwork(File source) {
+        if (source == null || !source.isFile() || source.length() <= 0) return "";
+        File directory = new File(App.get().getFilesDir(), "webhome_snapshot");
+        if (!directory.exists() && !directory.mkdirs()) return "";
+        File target = new File(directory, "snapshot-" + System.currentTimeMillis() + "-" + System.nanoTime() + ".jpg");
+        try (InputStream in = new FileInputStream(source); OutputStream out = new FileOutputStream(target)) {
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = in.read(buffer)) > 0) out.write(buffer, 0, read);
+        } catch (Throwable e) {
+            target.delete();
+            return "";
+        }
+        return Uri.fromFile(target).toString();
     }
 
     /** 删除某条历史对应的截图缓存；只接受本站 webhome_snapshot 目录下的 file:// 地址。 */

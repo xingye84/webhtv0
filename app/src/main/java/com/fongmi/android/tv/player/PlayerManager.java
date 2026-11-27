@@ -142,6 +142,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 import java.util.regex.Matcher;
@@ -265,6 +266,12 @@ public class PlayerManager implements ParseCallback {
     private long pendingSwitchPositionMs = C.TIME_UNSET;
     private long pendingInitialStartPositionMs = C.TIME_UNSET;
     /**
+     * 本次起播请求的历史进度。ijk 起播阶段做 buffer/解码的安全重载时，
+     * {@code player.getCurrentPosition()} 还是 0，以前直接拿 0 重开，历史进度就被丢掉、
+     * 从片头开始播。这里记一份，重载时若当前位置还在片头附近就沿用它。
+     */
+    private long mediaStartPositionMs = C.TIME_UNSET;
+    /**
      * 宿主从 History 里恢复出来的外挂字幕，等本次起播前注入。
      *
      * <p>不让宿主直接改 spec：spec 在 {@code parse()} 路径里是 PlayerManager 自己
@@ -334,6 +341,8 @@ public class PlayerManager implements ParseCallback {
     private int mpvOutputEvaluationSeq;
     private int mpvAutoOutputProbeAttempts;
     private float userPlaybackSpeed = 1f;
+    /** Guards the one speed-change audio rebuild; {@link #rebuildAudioPipeline()} re-applies speed. */
+    private boolean speedChangeAudioRebuildInProgress;
     private float networkProtectionSpeed = 1f;
     private float networkProtectionSupportedSpeed = 1f;
     private long networkProtectionMediaBitrate;
@@ -1067,9 +1076,8 @@ public class PlayerManager implements ParseCallback {
      *   <li>{@code kind=kernel|decode|none} 区分换内核、换软硬解，以及两者都没变
      *       （{@code none}：调用方只是想记一条原因，实际切换参数与当前一致）；</li>
      *   <li>{@code cause=} 机器可读原因（见各调用点）；</li>
-     *   <li>{@code chosen=} 本次切换是否把用户选定的内核记为会话内核
-     *       （即是否执行 {@code PlayerSetting.putActivePlayer(type)}），
-     *       不是「是否由用户发起」——用户手动换软硬解时它是 {@code false}；</li>
+     *   <li>{@code chosen=} 本次切换是否由用户选定（仅归因，与会话内核无关——会话内核
+     *       一律跟随实际引擎，自动回退也写），因此用户手动换软硬解时它同样是 {@code false}；</li>
      *   <li>{@code from/to} 同时给出内核名与软硬解，避免只看到其中一个维度。</li>
      * </ul>
      *
@@ -1643,10 +1651,40 @@ public class PlayerManager implements ParseCallback {
                 "apply request reason=%s requested=%.3f current=%.3f user=%.3f state=%d playing=%s loading=%s",
                 reason, speed, current, userPlaybackSpeed, player.getPlaybackState(), player.isPlaying(), player.isLoading()));
         if (Math.abs(current - speed) < 0.001f) return;
+        prepareExoAudioForSpeed(speed, current, reason);
         player.setPlaybackParameters(player.getPlaybackParameters().withSpeed(speed));
         logNetworkGuard(String.format(java.util.Locale.US,
                 "apply result reason=%s requested=%.3f actual=%.3f", reason, speed, player.getPlaybackParameters().speed));
         PlaybackTrace.log("exo-network-protection", playbackTrace.current(), "speed %.3f->%.3f reason=%s user=%.2f", current, speed, reason, userPlaybackSpeed);
+    }
+
+    /**
+     * Tells the EXO engine the rate before the player applies it, and gives an already running
+     * compressed output the chance to become PCM once. A vendor compressed track is decoded by the
+     * device, so neither the sink's processors nor a later speed value can change its rate; only a
+     * pipeline that selects the format again at this rate can. Rebuilding on every change would
+     * reload the media for nothing, hence the one-shot guards: the rate has to leave 1x, the
+     * current output still has to be that compressed output, and a rebuild that re-applies the
+     * speed must not arrive here again.
+     */
+    private void prepareExoAudioForSpeed(float speed, float current, String reason) {
+        if (!(engine instanceof ExoPlayerEngine exo)) return;
+        exo.setPlaybackSpeed(speed);
+        if (speedChangeAudioRebuildInProgress
+                || Math.abs(speed - 1f) < 0.001f
+                || Math.abs(current - 1f) >= 0.001f
+                || player.getPlaybackState() != Player.STATE_READY) return;
+        AudioPlaybackDiagnostics.OutputMode mode = getAudioPlaybackDiagnostics().outputMode();
+        if (mode != AudioPlaybackDiagnostics.OutputMode.PASSTHROUGH
+                && mode != AudioPlaybackDiagnostics.OutputMode.COMPRESSED_DIRECT) return;
+        speedChangeAudioRebuildInProgress = true;
+        try {
+            PlaybackTrace.log("exo-audio-direct", playbackTrace.current(),
+                    "speed %.3f->%.3f reason=%s rebuild=pcm", current, speed, reason);
+            rebuildAudioPipeline();
+        } finally {
+            speedChangeAudioRebuildInProgress = false;
+        }
     }
 
     private void resetNetworkProtectionSession(String reason) {
@@ -2435,9 +2473,11 @@ public void resetTrack(int type) {
     }
 
     /**
-     * chosen 区分「用户为本次播放选定的内核」与「当前实际在跑的引擎」：
-     * 手动切换要更新会话内核（供取播放地址、写历史使用），
-     * 而播放失败后的自动回退只换引擎，不能改写用户的选择。
+     * 会话内核（{@link PlayerSetting#putActivePlayer}）一律跟随本次实际建起来的引擎，
+     * 自动回退也不例外：取播放地址、IJK 运行时判定、LUT 资格都读它，
+     * 保留旧值只会让「以为在跑 A、实际在跑 B」的分叉继续传播。
+     * 用户选定的内核由历史记录承载（{@code rememberPlayerKernel}），不靠这里保留。
+     * {@code chosen} 只用于归因日志：本次切换是否由用户选定。
      */
     private void switchEngine(int type, boolean chosen, boolean preserveState, boolean notifyPrepare) {
         int decode = engine.getDecode();
@@ -2468,7 +2508,11 @@ public void resetTrack(int type) {
         stopNativeAudioSession();
         engine.release();
         playerType = type;
-        if (chosen) PlayerSetting.putActivePlayer(type);
+        // 会话内核必须等于刚建起来的这个引擎。自动回退（失败换核、内核不可用）也走这里：
+        // 留下旧值会让取播放地址、IJK 运行时判定、LUT 资格继续按已放弃的内核分叉，
+        // 于是「以为在跑 A、实际在跑 B」被后续每一次取址放大。用户的选择由历史记录承载，
+        // 每次起播 applyHistoryPlayerKernel() 会重新写回它。
+        PlayerSetting.putActivePlayer(type);
         logSwitchCause(cause, previousType, type, previousDecode, sanitizeDecode(decode), chosen, position);
         if (SpiderDebug.isEnabled()) SpiderDebug.log("player", "switch player type=%d chosen=%s position=%d spec=%s", type, chosen, position, debugSpec());
         engine = buildEngine(playerType, sanitizeDecode(decode));
@@ -2880,8 +2924,21 @@ public void resetTrack(int type) {
         IjkBufferController.Decision decision =
                 ijkBufferController.stageInitial(
                         playbackAutoSession, context.session(), policy);
+        IjkBufferPolicy.Config stagedConfig = decision.targetConfig();
+        if (isLegacyIjkContainer()) {
+            // 老容器不能靠运行期重开来把缓冲档位调大（重开要回收 SDL+EGL，会崩在 libijkplayer.so），
+            // 所以起播前就一次到位：档位顶到高水位（受内存天花板约束），水位 100/1000/5000ms。
+            // 这样“准备工作”全发生在 prepare 之前，播放中不再重启。
+            int ceiling = Math.max(IjkBufferPolicy.LOW_BUFFER_MB, decision.policy().memoryCeilingMb());
+            stagedConfig = new IjkBufferPolicy.Config(
+                    Math.min(IjkBufferPolicy.HIGH_BUFFER_MB, ceiling), 100, 1_000, 5_000);
+            PlaybackTrace.log("ijk-buffer", playbackTrace.current(),
+                    "action=stage-initial-legacy config=%s ceiling=%d url=%s",
+                    stagedConfig.label(), decision.policy().memoryCeilingMb(),
+                    spec == null ? "" : spec.getUrl());
+        }
         if (policy.managed()) {
-            ijk.stageAutomaticInputBufferConfig(decision.targetConfig());
+            ijk.stageAutomaticInputBufferConfig(stagedConfig);
         }
         IjkDecodePressureController.Decision decodeDecision =
                 ijkDecodePressureController.stageInitial(
@@ -2961,6 +3018,16 @@ public void resetTrack(int type) {
         boolean applySucceeded = decision.action()
                 != IjkBufferController.Action.RELOAD;
         if (decision.requestsReload()) {
+            // 老容器（PS/AVI 系）整会话重载要在 stop/reset 里回收 SDL+EGL，这段回收本身在这些片子上
+            // 会崩（日志 reason=CRASH_NATIVE status=11，栈落在 libijkplayer.so 的 pthread_cond_wait）。
+            // 缓冲配置对这类片子收益有限：不重开，只记一条跳过，配置留给下一次自然重开时应用。
+            if (isLegacyIjkContainer() && !isSafetyReloadNote(decision)) {
+                PlaybackTrace.log("ijk-buffer", playbackTrace.current(),
+                        "action=reload skip=legacy-container url=%s reason=%s",
+                        spec == null ? "" : spec.getUrl(), decision.reason().label());
+                publishIjkBufferDecision(decision, request, trigger, false, false, now);
+                return;
+            }
             boolean safetyReload = decision.reason()
                     == IjkBufferController.Reason.SAFETY_RELOAD;
             PlaybackExperimentPolicy.Action reloadAction = safetyReload
@@ -3374,6 +3441,32 @@ public void resetTrack(int type) {
         }
     }
 
+    /**
+     * mpg/avi 这类 PS/AVI 系老容器，重开一次会话就要走一遍 ijk 的 stop/reset 回收。
+     * 命中判定在下面统一 {@code toLowerCase}，所以光盘里大写的 {@code AVSEQ01.DAT} 一样命中；
+     * 小写 {@code .dat} 只是不会播放（视频判定只认大写），落在这里也不会有任何实际影响。
+     */
+    private static final Set<String> LEGACY_IJK_CONTAINERS = Set.of(
+            "mpg", "mpeg", "mpe", "vob", "avi", "wmv", "rm", "rmvb", "asf", "flv", "3gp", "f4v", "dat");
+
+    private boolean isLegacyIjkContainer() {
+        if (spec == null || TextUtils.isEmpty(spec.getUrl())) return false;
+        String path = spec.getUrl();
+        int cut = path.indexOf('?');
+        if (cut >= 0) path = path.substring(0, cut);
+        int slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+        String name = slash >= 0 ? path.substring(slash + 1) : path;
+        int dot = name.lastIndexOf('.');
+        if (dot < 0) return false;
+        return LEGACY_IJK_CONTAINERS.contains(name.substring(dot + 1).toLowerCase(Locale.ROOT));
+    }
+
+    /** 安全重载是兜底手段（不重开可能一直卡 buffering），老容器也保留这一条。 */
+    private static boolean isSafetyReloadNote(IjkBufferController.Decision decision) {
+        return decision != null
+                && decision.reason() == IjkBufferController.Reason.SAFETY_RELOAD;
+    }
+
     private boolean restartIjkBuffer(
             IjkPlayerEngine ijk,
             IjkBufferController.Decision decision) {
@@ -3384,6 +3477,13 @@ public void resetTrack(int type) {
         boolean repeat = isRepeatOne();
         long position = ijk.isVod()
                 ? Math.max(0, player.getCurrentPosition()) : C.TIME_UNSET;
+        // 首帧还没出来之前，引擎报的「当前位置」没有意义（就是 0）：这段区间内的重载必须沿用
+        // 本次打开的起播位置，否则重开一次就从 0 播。用「首帧是否已出」判断，不再用位置大小猜。
+        if (!playbackTrace.hasStage(PlaybackTrace.Stage.FIRST_FRAME) && mediaStartPositionMs > 0) {
+            PlaybackTrace.log("ijk-buffer", playbackTrace.current(),
+                    "action=reload resume-from-start target=%d current=%d", mediaStartPositionMs, position);
+            position = mediaStartPositionMs;
+        }
         try {
             prepareSeq++;
             App.removeCallbacks(runnable);
@@ -6301,6 +6401,7 @@ public void resetTrack(int type) {
         clearDanmaku("start");
         this.spec = spec;
         pendingInitialStartPositionMs = positionMs > 0 ? positionMs : C.TIME_UNSET;
+        mediaStartPositionMs = positionMs > 0 ? positionMs : C.TIME_UNSET;
         prepareMpvOutputForNewItem();
         beginPlaybackTrace("start", false);
         this.playWhenReady = playWhenReady;
@@ -6333,6 +6434,7 @@ public void resetTrack(int type) {
         clearDanmaku("parse");
         spec = PlaySpec.fromParse(result, key, metadata, useParse);
         pendingInitialStartPositionMs = positionMs > 0 ? positionMs : C.TIME_UNSET;
+        mediaStartPositionMs = positionMs > 0 ? positionMs : C.TIME_UNSET;
         prepareMpvOutputForNewItem();
         beginPlaybackTrace("parse", false);
         this.playWhenReady = playWhenReady;

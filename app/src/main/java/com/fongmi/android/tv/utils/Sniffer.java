@@ -34,6 +34,8 @@ public class Sniffer {
     // /file 是 WebHTV 本机文件代理，必须按真实后缀判直链；否则 avi/wmv 等会被当成网页，
     // 走 WebView 嗅探 30 秒后报“播放地址解析失败”。
     public static final Pattern LOCAL_FILE_VIDEO = Pattern.compile("\\.(?:avi|wmv|asf|rmvb|rm|vob|mpg|mpeg|divx|xvid|f4v|ts|m2ts|3gp|webm|mov)(?:\\?.*)?$", Pattern.CASE_INSENSITIVE);
+    /** 光盘数据区的大写 .DAT（MPEG-PS 正片）。小写 .dat 多为纯数据，不当视频直链。 */
+    public static final Pattern LOCAL_FILE_DISC_DAT = Pattern.compile("\\.DAT(?:\\?.*)?$");
 
     public static String getUrl(String text) {
         // 携带请求头的推送串：不能走 AI_PUSH 正则，否则 json 里的空格会把地址截断
@@ -143,7 +145,8 @@ public class Sniffer {
         if (url.startsWith("http://127.0.0.1:") && url.contains("smb=1")) return true;
         // 推送串带 @Headers= 时同样要剥掉，否则 .m3u8@Headers= 匹配不上
         url = pushUrl(url);
-        if (url.contains("/file/") && LOCAL_FILE_VIDEO.matcher(url).find()) return true;
+        if (url.contains("/file/")
+                && (LOCAL_FILE_VIDEO.matcher(url).find() || LOCAL_FILE_DISC_DAT.matcher(url).find())) return true;
         Rule rule = getRule(UrlUtil.uri(url));
         for (String exclude : rule.getExclude()) if (url.contains(exclude)) return false;
         for (String exclude : rule.getExclude()) if (Pattern.compile(exclude).matcher(url).find()) return false;
@@ -183,19 +186,48 @@ public class Sniffer {
         int start = span.length();
         span.append(value);
         if (types.isEmpty()) return;
-        // 多条链接按"/"拆分名字，与数组顺序一一对应；条数对不上就整段挂第一项，避免拆出半截文本
-        String[] names = types.size() > 1 ? value.split("/") : new String[]{value};
-        if (names.length != types.size()) {
+        if (types.size() == 1) {
             span.setSpan(factory.apply(Result.type(types.get(0))), start, span.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
             return;
         }
-        int offset = start;
-        for (int i = 0; i < names.length; i++) {
-            int begin = offset + (i > 0 ? 1 : 0);
-            int end = begin + names[i].length();
-            span.setSpan(factory.apply(Result.type(types.get(i))), begin, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-            offset = end;
+        // 多个名字与多个链接按顺序一一对应；分隔符只认 / 、 , ，（站源三种写法都常见，
+        // 原来只认 "/"，用逗号写的名字会被当成一整段，结果只有第一个名字能点）。
+        List<int[]> ranges = nameRanges(value);
+        if (ranges.size() != types.size()) {
+            span.setSpan(factory.apply(Result.type(types.get(0))), start, span.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            return;
         }
+        for (int i = 0; i < ranges.size(); i++) {
+            int[] range = ranges.get(i);
+            int begin = start + range[0];
+            int end = start + range[1];
+            span.setSpan(factory.apply(Result.type(types.get(i))), begin, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
+    }
+
+    /** 按 / 、 , ， 切出每个名字的起止下标（相对入参），两端空白不计入范围。 */
+    private static List<int[]> nameRanges(String value) {
+        List<int[]> ranges = new ArrayList<>();
+        int length = value.length();
+        int from = -1;
+        for (int index = 0; index <= length; index++) {
+            boolean separator = index == length || isNameSeparator(value.charAt(index));
+            if (!separator) {
+                if (from < 0 && !Character.isWhitespace(value.charAt(index))) from = index;
+                continue;
+            }
+            if (from >= 0) {
+                int to = index;
+                while (to > from && Character.isWhitespace(value.charAt(to - 1))) to--;
+                if (to > from) ranges.add(new int[]{from, to});
+                from = -1;
+            }
+        }
+        return ranges;
+    }
+
+    private static boolean isNameSeparator(char value) {
+        return value == '/' || value == '、' || value == ',' || value == '，';
     }
 
     // {…} 原样返回；[…] 按顶层大括号拆成多条，供逐个名字挂点击

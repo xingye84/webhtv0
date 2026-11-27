@@ -18,6 +18,7 @@ import android.content.Intent;
 import android.net.Uri;
 import android.provider.Settings;
 import android.graphics.Typeface;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.drawable.ColorDrawable;
 import android.content.res.ColorStateList;
@@ -31,7 +32,6 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowManager;
-import android.widget.ArrayAdapter;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.FrameLayout;
@@ -51,10 +51,20 @@ import com.bumptech.glide.load.resource.bitmap.DownsampleStrategy;
 
 import com.fongmi.android.tv.R;
 import com.fongmi.android.tv.api.SiteApi;
+import com.fongmi.android.tv.bean.Episode;
+import com.fongmi.android.tv.bean.Flag;
+import com.fongmi.android.tv.bean.Site;
+import com.fongmi.android.tv.bean.Vod;
+import com.fongmi.android.tv.share.SmbShareController;
+import com.fongmi.android.tv.share.SmbShareService;
 import com.fongmi.android.tv.smb.SmbClient;
 import com.fongmi.android.tv.smb.SmbCredentialStore;
 import com.fongmi.android.tv.smb.SmbNetworkScanner;
+import com.fongmi.android.tv.smb.SmbFolder;
 import com.fongmi.android.tv.smb.SmbPlaybackProxy;
+import com.fongmi.android.tv.smb.SmbRowAdapter;
+import com.fongmi.android.tv.smb.SmbThumbnailCache;
+import com.fongmi.android.tv.setting.PlayerSetting;
 import com.google.android.material.dialog.MaterialAlertDialogBuilder;
 import com.google.android.material.button.MaterialButton;
 import com.google.android.material.color.MaterialColors;
@@ -66,6 +76,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 import org.json.JSONObject;
@@ -83,7 +94,6 @@ public class SmbBrowserActivity extends AppCompatActivity {
     private static final String PREF_HIDDEN_PASSWORD = "hidden_password";
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
-    private final List<String> displayItems = new ArrayList<>();
     private final List<String> hosts = new ArrayList<>();
     private final List<String> shares = new ArrayList<>();
     private final List<SmbClient.Entry> files = new ArrayList<>();
@@ -98,7 +108,11 @@ public class SmbBrowserActivity extends AppCompatActivity {
     private TextView title;
     private TextView status;
     private ListView list;
-    private ArrayAdapter<String> adapter;
+    private SmbRowAdapter adapter;
+    /** 图片预览点击分区用：最后一次按下/抬起的横坐标。 */
+    private float lastTouchX;
+    /** 从收藏夹点开图片时，目录列表还没加载完，翻页范围先用收藏夹里算好的这份。 */
+    private List<String> pendingImagePages;
 
     private Mode mode = Mode.HOSTS;
     private String host;
@@ -181,7 +195,7 @@ public class SmbBrowserActivity extends AppCompatActivity {
         list.setDividerHeight(dp(1));
         list.setDivider(new ColorDrawable(MaterialColors.getColor(this, com.google.android.material.R.attr.colorOutlineVariant, 0x334F5B6B)));
         list.setBackgroundColor(surface);
-        adapter = new ArrayAdapter<>(this, android.R.layout.simple_list_item_1, displayItems);
+        adapter = new SmbRowAdapter(this);
         list.setAdapter(adapter);
         configureToolbarFocus(back, favoritesButton, hiddenButton);
         list.setOnKeyListener((view, keyCode, event) -> {
@@ -582,6 +596,16 @@ public class SmbBrowserActivity extends AppCompatActivity {
         path=cut<0?"":remote.substring(0,cut);
         mode=Mode.FILES;
         // 先回到文件所在目录，播放/预览返回时列表就是真实目录，而不是残留的收藏夹。
+        List<String> favoritePages = new ArrayList<>();
+        if (SmbClient.isImage(name)) {
+            for (String value : values) {
+                String[] parts = value.split("\n", 4);
+                if (parts.length != 4 || parts[3].equals("D")) continue;
+                if (!parts[0].equals(host) || !parts[1].equals(share)) continue;
+                if (SmbClient.isImage(parts[2])) favoritePages.add(parts[2]);
+            }
+            pendingImagePages = favoritePages;
+        }
         loadDirectory();
         if(SmbClient.isVideo(name)||SmbClient.isAudio(name)) play(remote);
         else if(SmbClient.isImage(name)) showImage(remote);
@@ -809,6 +833,12 @@ public class SmbBrowserActivity extends AppCompatActivity {
             String note = savedHosts.get(host);
             labels.add((note == null ? "" : "★ ") + host + (note == null || note.isEmpty() ? "" : "  ·  " + note));
         }
+        // 末尾固定一行「分享本机」：手机把本机目录分享出去，另一端的 SMB 浏览就能搜到。
+        boolean sharing = SmbShareController.isSharing(this);
+        String lock = SmbShareController.user(this).isEmpty() || SmbShareController.password(this).isEmpty()
+                ? "" : "（需账号密码）";
+        labels.add(sharing ? "■ 分享设置  ·  " + SmbShareController.label(this) + lock
+                : "＋ 分享本机文件（SMB 只读）");
         return labels;
     }
 
@@ -869,9 +899,192 @@ public class SmbBrowserActivity extends AppCompatActivity {
     }
 
     private void setItems(List<String> values) {
-        displayItems.clear();
-        if (values != null) displayItems.addAll(values);
-        adapter.notifyDataSetChanged();
+        List<SmbRowAdapter.Row> rows = new ArrayList<>();
+        if (values != null) for (String value : values) rows.add(SmbRowAdapter.Row.fromLabel(value));
+        adapter.setRows(rows);
+    }
+
+    private boolean isOwnShareHost(String value) {
+        if (value == null) return false;
+        int cut = value.lastIndexOf(':');
+        return cut > 0 && value.substring(cut + 1).chars().allMatch(Character::isDigit);
+    }
+
+    private void toggleShare() {
+        showShareSettings();
+    }
+
+    /** 分享设置入口：开关、分享哪个目录、账号密码。运行中也能改，改完立即重启服务端生效。 */
+    private void showShareSettings() {
+        boolean sharing = SmbShareController.isSharing(this);
+        List<String> actions = new ArrayList<>();
+        List<Runnable> tasks = new ArrayList<>();
+        if (sharing) {
+            actions.add("停止分享");
+            tasks.add(this::stopShare);
+        } else {
+            actions.add("开始分享");
+            tasks.add(this::startShare);
+        }
+        actions.add("分享目录：" + SmbShareController.root(this).getAbsolutePath());
+        tasks.add(this::showShareRootPicker);
+        String account = SmbShareController.user(this);
+        String secret = SmbShareController.password(this);
+        boolean secured = !account.isEmpty() && !secret.isEmpty();
+        actions.add("账号密码：" + (secured ? account : "未设置（匿名可访问）"));
+        tasks.add(this::showShareAccountDialog);
+        actions.add("本机地址：" + SmbShareController.label(this));
+        tasks.add(() -> Toast.makeText(this, SmbShareController.label(this), Toast.LENGTH_LONG).show());
+
+        // 纯文本行 + 上下 8dp 间隔：与现有 SMB 列表同一套风格，不加底块，只让多行条目别再挤在一起。
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(6), dp(4), dp(6), dp(4));
+        AlertDialog dialog = new MaterialAlertDialogBuilder(this)
+                .setTitle("本机文件分享")
+                .setView(box)
+                .setNegativeButton(android.R.string.cancel, null)
+                .create();
+        int rowColor = MaterialColors.getColor(this, com.google.android.material.R.attr.colorOnSurface, 0xFFFFFFFF);
+        for (int index = 0; index < actions.size(); index++) {
+            TextView row = new TextView(this);
+            row.setText(actions.get(index));
+            row.setTextColor(rowColor);
+            row.setTextSize(18);
+            row.setPadding(dp(16), dp(11), dp(16), dp(11));
+            row.setFocusable(true);
+            row.setClickable(true);
+            TypedValue ripple = new TypedValue();
+            getTheme().resolveAttribute(android.R.attr.selectableItemBackground, ripple, true);
+            row.setBackgroundResource(ripple.resourceId);
+            final Runnable task = tasks.get(index);
+            row.setOnClickListener(view -> {
+                dialog.dismiss();
+                task.run();
+            });
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
+            params.topMargin = dp(8);
+            params.bottomMargin = dp(8);
+            box.addView(row, params);
+        }
+        dialog.show();
+    }
+
+    private void startShare() {
+        File root = SmbShareController.root(this);
+        if (!SmbShareController.startServer(this, root, SmbShareController.port(this),
+                SmbShareController.user(this), SmbShareController.password(this))) {
+            Toast.makeText(this, "分享启动失败：端口被占用或目录不可读", Toast.LENGTH_LONG).show();
+            return;
+        }
+        SmbShareService.start(this);
+        setItems(hostLabels());
+        setStatus("正在分享：" + SmbShareController.label(this));
+    }
+
+    private void stopShare() {
+        SmbShareService.stop(this);
+        SmbShareController.stopServer(this);
+        setItems(hostLabels());
+        setStatus("已停止分享本机文件");
+    }
+
+    /** 目录选择器：当前目录的子目录可以点进去，「选择此目录」把当前目录设为分享根。 */
+    private void showShareRootPicker() {
+        showShareRootPicker(SmbShareController.root(this));
+    }
+
+    private void showShareRootPicker(File dir) {
+        File[] found = dir.listFiles(File::isDirectory);
+        List<File> dirs = new ArrayList<>();
+        if (found != null) {
+            for (File child : found) if (!child.isHidden()) dirs.add(child);
+        }
+        dirs.sort((first, second) -> first.getName().compareToIgnoreCase(second.getName()));
+        File parent = dir.getParentFile();
+        List<String> labels = new ArrayList<>();
+        // “上一级”放进列表首行：底部三个按钮在窄屏上会互相挤压，只留两个按钮就不截断了。
+        if (parent != null) labels.add("⬆ 上一级");
+        for (File child : dirs) labels.add("📁 " + child.getName());
+        if (labels.isEmpty() || (parent == null && dirs.isEmpty())) labels.add("（没有子目录）");
+        new MaterialAlertDialogBuilder(this)
+                .setTitle(dir.getAbsolutePath())
+                .setItems(labels.toArray(new String[0]), (dialog, which) -> {
+                    int index = parent != null ? which - 1 : which;
+                    if (parent != null && index < 0) showShareRootPicker(parent);
+                    else if (index >= 0 && index < dirs.size()) showShareRootPicker(dirs.get(index));
+                })
+                .setPositiveButton("选择此目录", (dialog, which) -> applyShareRoot(dir))
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    private void applyShareRoot(File dir) {
+        boolean applied = SmbShareController.apply(this, dir, SmbShareController.user(this),
+                SmbShareController.password(this), SmbShareController.port(this));
+        if (!applied) {
+            Toast.makeText(this, "切换分享目录失败：目录不可读或端口被占用", Toast.LENGTH_LONG).show();
+            return;
+        }
+        setItems(hostLabels());
+        setStatus(SmbShareController.isSharing(this)
+                ? "分享目录已改为 " + dir.getAbsolutePath()
+                : "分享目录已设为 " + dir.getAbsolutePath());
+    }
+
+    /** 账号密码：两者都填才启用校验（匿名会被拒绝）；都留空就是匿名开放全部。 */
+    private void showShareAccountDialog() {
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(dp(22), dp(8), dp(22), 0);
+        EditText user = field("账号（留空=匿名开放）", InputType.TYPE_CLASS_TEXT);
+        user.setText(SmbShareController.user(this));
+        form.addView(user);
+        EditText pass = addSecretField(form, "密码（留空=匿名开放）", SmbShareController.password(this));
+        new MaterialAlertDialogBuilder(this)
+                .setTitle("分享账号密码")
+                .setView(form)
+                .setNeutralButton("清除（改回匿名）", (dialog, which) -> applyShareAccount("", ""))
+                .setNegativeButton(android.R.string.cancel, null)
+                .setPositiveButton("保存", (dialog, which) ->
+                        applyShareAccount(user.getText().toString().trim(), pass.getText().toString()))
+                .show();
+    }
+
+    private void applyShareAccount(String user, String password) {
+        if (user.isEmpty() != password.isEmpty()) {
+            Toast.makeText(this, "账号和密码要么都填，要么都留空", Toast.LENGTH_LONG).show();
+            return;
+        }
+        boolean applied = SmbShareController.apply(this, SmbShareController.root(this), user, password,
+                SmbShareController.port(this));
+        if (!applied) {
+            Toast.makeText(this, "保存账号密码失败：端口被占用", Toast.LENGTH_LONG).show();
+            return;
+        }
+        setItems(hostLabels());
+        setStatus(user.isEmpty() ? "已改回匿名开放（无账号密码）" : "分享账号密码已设置");
+    }
+
+    /**
+     * 密码输入框：标准掩码（全部显示为 *）。
+     *
+     * <p>曾做过“最后一个字符短暂可见”，实现必须在输入过程中反复切 setTransformationMethod()，
+     * 而它内部会 setText() 并触发 IME restartInput，MIUI 上会踩到布局未更新的 getFocusedRect，
+     * 实测两种崩溃（无限递归 / IndexOutOfBounds）。稳定性优先，回到系统密码框的标准行为。</p>
+     */
+    /**
+     * 密码输入框：就用系统标准掩码输入框，和“分享设置”里那个账号密码框完全同一套处理。
+     *
+     * <p>之前试过“最后一位短暂可见”，需要在输入过程中反复切 setTransformationMethod()，
+     * 而它内部会 setText() 并让 IME restartInput，MIUI 上会拿到过期布局直接 IndexOutOfBounds。
+     * 稳定优先，两个入口统一成这一种写法。</p>
+     */
+    private EditText addSecretField(LinearLayout form, String hint, String initial) {
+        EditText edit = field(hint, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        if (initial != null && !initial.isEmpty()) edit.setText(initial);
+        form.addView(edit);
+        return edit;
     }
 
     private void scanNetwork() {
@@ -924,6 +1137,10 @@ public class SmbBrowserActivity extends AppCompatActivity {
         if(showingFavorites) { openFavorite(position); return; }
         if(showingHiddenHosts||showingHiddenFolders) { openHiddenItem(position); return; }
         if (mode == Mode.HOSTS) {
+            if (position == hosts.size()) {
+                toggleShare();
+                return;
+            }
             if (position < hosts.size()) connectHost(hosts.get(position), false);
             return;
         }
@@ -938,7 +1155,9 @@ public class SmbBrowserActivity extends AppCompatActivity {
             if (entry.directory) {
                 path = remotePath;
                 loadDirectory();
-            } else if (SmbClient.isVideo(entry.name) || SmbClient.isAudio(entry.name)) {
+            } else if (SmbClient.isVideo(entry.name)) {
+                openFolderVod(remotePath);
+            } else if (SmbClient.isAudio(entry.name)) {
                 play(remotePath);
             } else if (SmbClient.isImage(entry.name)) {
                 showImage(remotePath);
@@ -968,6 +1187,19 @@ public class SmbBrowserActivity extends AppCompatActivity {
             }
         }
         loginAttempted = false;
+        // 带端口的主机是本项目自家的分享（非 root 只能绑 4450）：共享名固定 webhtv，
+        // 而且自家服务端不实现 srvsvc 枚举，直接进共享目录，别再走 listShares。
+        if (isOwnShareHost(value)) {
+            share = ownShareName(value);
+            path = "";
+            mode = Mode.FILES;
+            showingFavorites = false;
+            showingHiddenHosts = false;
+            showingHiddenFolders = false;
+            title.setText(value);
+            loadDirectory();
+            return;
+        }
         setStatus("正在连接 " + value + " …");
         worker.execute(() -> {
             try {
@@ -1005,6 +1237,10 @@ public class SmbBrowserActivity extends AppCompatActivity {
 
     private void showAuthDialog() {
         loginAttempted = true;
+        if (isOwnShareHost(host)) {
+            showShareLoginDialog();
+            return;
+        }
         SmbCredentialStore.Stored stored = SmbCredentialStore.load(this, host);
         if (stored != null && username.isEmpty()) {
             username = stored.username;
@@ -1103,6 +1339,63 @@ public class SmbBrowserActivity extends AppCompatActivity {
                 .show();
     }
 
+    /** 自家分享的共享名固定 webhtv：改它只会让另一端更难连，没有意义，所以不再可配。 */
+    private String ownShareName(String hostName) {
+        return SmbShareController.SHARE;
+    }
+
+    /**
+     * 访问自家分享：服务端只校验口令不校验用户名，所以固定用 guest 这类非空用户名走 NTLMv2，
+     * 真正的门槛是分享方设置的密码。
+     */
+    private void showShareLoginDialog() {
+        loginAttempted = true;
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(dp(22), dp(8), dp(22), 0);
+        EditText user = field("账号（分享方设置的账号）", InputType.TYPE_CLASS_TEXT);
+        user.setText(username);
+        form.addView(user);
+        EditText pass = addSecretField(form, "密码（分享方设置的密码）", password);
+        new MaterialAlertDialogBuilder(this)
+                .setTitle("访问分享 · " + host)
+                .setView(form)
+                .setNegativeButton(android.R.string.cancel, (dialog, which) -> setStatus(getString(R.string.smb_auth_failed)))
+                .setPositiveButton(R.string.smb_login, (dialog, which) -> {
+                    final String keeper = user.getText().toString().trim();
+                    final String secret = pass.getText().toString();
+                    if (keeper.isEmpty() || secret.isEmpty()) {
+                        Toast.makeText(this, "请填写分享方设置的账号和密码", Toast.LENGTH_LONG).show();
+                        loginAttempted = false;
+                        showShareLoginDialog();
+                        return;
+                    }
+                    worker.execute(() -> {
+                        try {
+                            SmbClient.listFiles(host, share.isEmpty() ? ownShareName(host) : share,
+                                    "", keeper, secret, "");
+                            runOnUiThread(() -> {
+                                username = keeper;
+                                password = secret;
+                                domain = "";
+                                try {
+                                    SmbCredentialStore.save(this, host, username, password, domain);
+                                } catch (Exception ignored) {
+                                }
+                                connectHost(host, true);
+                            });
+                        } catch (Exception error) {
+                            runOnUiThread(() -> {
+                                setStatus(getString(R.string.smb_auth_failed) + "：" + shortError(error));
+                                loginAttempted = false;
+                                showShareLoginDialog();
+                            });
+                        }
+                    });
+                })
+                .show();
+    }
+
     private void showManualShareDialog() {
         EditText input = field(getString(R.string.smb_share_name), InputType.TYPE_CLASS_TEXT);
         new MaterialAlertDialogBuilder(this)
@@ -1124,6 +1417,19 @@ public class SmbBrowserActivity extends AppCompatActivity {
         return edit;
     }
 
+    /** 同名历史里取一个已知的总时长；没有播放过就返回 0（海报不显示副标题）。 */
+    private long longestKnownDuration(String name) {
+        try {
+            long best = 0;
+            for (com.fongmi.android.tv.bean.History history : com.fongmi.android.tv.bean.History.findByName(name)) {
+                best = Math.max(best, history.getDuration());
+            }
+            return best;
+        } catch (Throwable ignored) {
+            return 0;
+        }
+    }
+
     private void openShare(String value) {
         showingFavorites = false;
         share = value;
@@ -1143,26 +1449,66 @@ public class SmbBrowserActivity extends AppCompatActivity {
         worker.execute(() -> {
             try {
                 List<SmbClient.Entry> found = SmbClient.listFiles(host, share, path, username, password, domain);
+                // 目录海报的时长副标题：只从最近观看里取已知时长（播放过才有），查不到就不显示。
+                // 放在这里（worker 线程）查，别让主线程为每一行跑一次数据库。
+                Map<String, Long> durations = new HashMap<>();
+                for (SmbClient.Entry entry : found) {
+                    if (entry.directory || !SmbClient.isVideo(entry.name)) continue;
+                    long value = longestKnownDuration(entry.name);
+                    if (value > 0) durations.put(entry.name, value);
+                }
                 runOnUiThread(() -> {
                     files.clear();
                     files.addAll(found);
                     visibleFiles.clear();
-                    List<String> labels = new ArrayList<>();
+                    List<SmbRowAdapter.Row> rows = new ArrayList<>();
                     for (SmbClient.Entry entry : found) {
                         String remotePath = path.isEmpty() ? entry.name : path + "\\" + entry.name;
                         if (entry.directory && isHiddenFolder(remotePath)) continue;
                         visibleFiles.add(entry);
-                        String icon = entry.directory ? "📁  " : SmbClient.isApk(entry.name) ? "📦  "
-                                : SmbClient.isImage(entry.name) ? "🖼️  " : SmbClient.isAudio(entry.name) ? "♫  "
-                                : SmbClient.isVideo(entry.name) ? "▶  " : "📄  ";
-                        labels.add(icon + entry.name);
+                        if (entry.directory) {
+                            rows.add(SmbRowAdapter.Row.icon(entry.name, "", "📁"));
+                        } else if (SmbClient.isVideo(entry.name)) {
+                            // 视频行给缩略图：取帧走缩略图专用 token 池，不会挤掉正在播放的直链。
+                            // 老容器（avi/wmv/rmvb 等）系统取帧器（MMR）解不出来，但内置 FFmpeg 能解，
+                            // 所以这里一律允许取帧；MMR 那条只作兜底，解不了就等播放时补图。
+                            String thumbUrl = null;
+                            try {
+                                thumbUrl = SmbPlaybackProxy.createThumbUrl(host, share, remotePath, username, password, domain);
+                            } catch (IOException ignored) {
+                                thumbUrl = null;
+                            }
+                            long durationMs = durations.getOrDefault(entry.name, 0L);
+                            rows.add(thumbUrl == null
+                                    ? SmbRowAdapter.Row.icon(entry.name, "", "▶")
+                                    : SmbRowAdapter.Row.video(entry.name, "",
+                                    SmbThumbnailCache.key(host, share, remotePath), thumbUrl, true, durationMs));
+                        } else if (SmbClient.isAudio(entry.name)) {
+                            rows.add(SmbRowAdapter.Row.icon(entry.name, "", "♫"));
+                        } else if (SmbClient.isImage(entry.name)) {
+                            rows.add(SmbRowAdapter.Row.icon(entry.name, "", "🖼️"));
+                        } else if (SmbClient.isApk(entry.name)) {
+                            rows.add(SmbRowAdapter.Row.icon(entry.name, "", "📦"));
+                        } else {
+                            rows.add(SmbRowAdapter.Row.icon(entry.name, "", "📄"));
+                        }
                     }
-                    setItems(labels);
+                    adapter.setRows(rows);
                     title.setText(host + " / " + share + (path.isEmpty() ? "" : " / " + path));
-                    setStatus(found.isEmpty() ? getString(R.string.smb_no_files) : "视频/音乐可播放，图片可查看，APK 可安装");
+                    // 顶部注释直接显示当前路径，不再拿玩法提示占位。
+                    setStatus(found.isEmpty() ? getString(R.string.smb_no_files)
+                            : host + " / " + share + (path.isEmpty() ? "" : " / " + path));
                 });
             } catch (Exception e) {
-                runOnUiThread(() -> setStatus(getString(R.string.smb_connect_failed) + "：" + shortError(e)));
+                runOnUiThread(() -> {
+                    // 自家分享开了口令，匿名访问会被拒：直接引导输入密码，而不是只报连接失败。
+                    if (isOwnShareHost(host) && !loginAttempted) {
+                        setStatus("需要访问口令");
+                        showAuthDialog();
+                        return;
+                    }
+                    setStatus(getString(R.string.smb_connect_failed) + "：" + shortError(e));
+                });
             }
         });
     }
@@ -1272,6 +1618,100 @@ public class SmbBrowserActivity extends AppCompatActivity {
         }
     }
 
+    /**
+     * 点目录里的视频：本目录的视频做成“剧集”，点中的那一集是当前集。
+     * 每集的链接仍然走 {@link SmbPlaybackProxy}（和现在单文件播放同一个入口、同一套代理），
+     * 详情图只用当前这一集的抽帧封面，不会为每集各抽一张。
+     *
+     * 目录里的视频做成一个真 {@link Vod} 直接进原生详情页：线路里每集都是本机代理地址，
+     * 点中的那集排在第一位（当前集），封面用点中文件已经抽好的那张缩略图。
+     * 目录里只有一个视频时退回单文件播放。
+     */
+    private void openFolderVod(String current) {
+        List<SmbClient.Entry> videos = new ArrayList<>();
+        for (SmbClient.Entry entry : visibleFiles) {
+            if (!entry.directory && SmbClient.isVideo(entry.name)) videos.add(entry);
+        }
+        videos.sort((a, b) -> String.CASE_INSENSITIVE_ORDER.compare(a.name, b.name));
+        if (videos.size() < 2) {
+            play(current);
+            return;
+        }
+        String folder = path.isEmpty() ? getString(R.string.smb_browser_title)
+                : path.substring(path.lastIndexOf((char) 92) + 1);
+        // 点中的那集排第一：详情页的当前集、起播位置都跟着第一位走，不依赖 isSelected 在
+        // 线路重建后还活着（这条链路里它会丢）。
+        List<SmbClient.Entry> ordered = new ArrayList<>();
+        ordered.add(null);
+        for (SmbClient.Entry entry : videos) {
+            String remote = path.isEmpty() ? entry.name : path + "\\" + entry.name;
+            if (current.equals(remote)) ordered.set(0, entry);
+            else ordered.add(entry);
+        }
+        // SmbPlaybackProxy 的直链池只有 24 条（超了会挤掉最早注册的那条，正好是当前集），
+        // 超过 24 个视频就按前 24 个做剧集，当前集始终在里面。
+        while (ordered.size() > 24) ordered.remove(ordered.size() - 1);
+        StringBuilder urls = new StringBuilder();
+        String currentUrl = null;
+        try {
+            for (SmbClient.Entry entry : ordered) {
+                if (entry == null) continue;
+                String remote = path.isEmpty() ? entry.name : path + "\\" + entry.name;
+                String url = SmbPlaybackProxy.createUrl(host, share, remote, username, password, domain);
+                if (current.equals(remote)) currentUrl = url;
+                if (urls.length() > 0) urls.append('#');
+                urls.append(stripExtension(entry.name)).append('$').append(url);
+            }
+        } catch (Exception e) {
+            Toast.makeText(this, getString(R.string.smb_connect_failed) + "：" + shortError(e), Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (currentUrl == null) {
+            play(current);
+            return;
+        }
+        Vod vod = new Vod();
+        // 线路 key 必须落成 push_agent，和本地 file 推送进详情页同一个 key。
+        Site site = new Site();
+        site.setKey(SiteApi.PUSH);
+        site.setName("SMB");
+        vod.setSite(site);
+        // id 用稳定的目录描述符，不能用代理直链：直链 token 只在进程内存里活着，
+        // 历史点开时既恢复不出整张剧集表，也打不开原来那个文件。
+        String currentName = current.substring(current.lastIndexOf((char) 92) + 1);
+        vod.setId(SmbFolder.encode(host, share, path, currentName));
+        // 标题用点开的那一集（去扩展名），不再拿目录名冒充片名。
+        vod.setName(stripExtension(currentName));
+        vod.setPlayUrl(currentUrl);
+        vod.setPic(folderCover(currentUrl));
+        // 线路名用目录名：一眼能看出这是哪一部（片名仍用点开的那一集）。
+        Flag flag = Flag.create(folder, urls.toString());
+        for (Episode episode : flag.getEpisodes()) {
+            if (currentUrl.equals(episode.getUrl())) episode.setSelected(true);
+        }
+        vod.setFlags(new ArrayList<>());
+        vod.getFlags().add(flag);
+        VideoActivity.startDirectResolved(this, vod);
+    }
+
+    /** 详情图用点中文件已经抽好落盘的缩略图；没有就不传，留空比塞错图强。 */
+    private String folderCover(String currentUrl) {
+        try {
+            String key = SmbPlaybackProxy.keyForUrl(currentUrl);
+            if (key == null) return "";
+            File thumb = SmbThumbnailCache.file(this, key);
+            if (thumb == null || !thumb.isFile() || thumb.length() <= 0) return "";
+            return "file://" + thumb.getAbsolutePath();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private String stripExtension(String name) {
+        int dot = name.lastIndexOf('.');
+        return dot > 0 ? name.substring(0, dot) : name;
+    }
+
     private void play(String remotePath) {
         try {
             String url = SmbPlaybackProxy.createUrl(host, share, remotePath, username, password, domain);
@@ -1283,114 +1723,235 @@ public class SmbBrowserActivity extends AppCompatActivity {
     }
 
     private void showImage(String remotePath) {
-        try {
-            String url = SmbPlaybackProxy.createUrl(host, share, remotePath, username, password, domain);
-            String name = remotePath.substring(remotePath.lastIndexOf((char) 92) + 1);
+        List<String> pages = imagePages(remotePath);
+        int index = pages.indexOf(remotePath);
+        if (index < 0) {
+            pages = new ArrayList<>();
+            pages.add(remotePath);
+            index = 0;
+        }
 
-            LinearLayout content = new LinearLayout(this);
-            content.setOrientation(LinearLayout.VERTICAL);
-            content.setBackgroundColor(Color.BLACK);
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setBackgroundColor(Color.BLACK);
 
-            TextView imageTitle = new TextView(this);
-            imageTitle.setText(name);
-            imageTitle.setTextColor(MaterialColors.getColor(this,
-                    com.google.android.material.R.attr.colorOnPrimaryContainer, Color.WHITE));
-            imageTitle.setTextSize(18);
-            imageTitle.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-            imageTitle.setGravity(Gravity.CENTER_VERTICAL);
-            imageTitle.setPadding(dp(20), dp(12), dp(20), dp(12));
-            imageTitle.setBackgroundColor(MaterialColors.getColor(this,
-                    com.google.android.material.R.attr.colorPrimaryContainer, 0xFF394B63));
-            content.addView(imageTitle, new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, dp(52)));
+        TextView imageTitle = new TextView(this);
+        imageTitle.setTextColor(MaterialColors.getColor(this,
+                com.google.android.material.R.attr.colorOnPrimaryContainer, Color.WHITE));
+        imageTitle.setTextSize(18);
+        imageTitle.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        imageTitle.setGravity(Gravity.CENTER_VERTICAL);
+        imageTitle.setPadding(dp(20), dp(12), dp(20), dp(12));
+        imageTitle.setBackgroundColor(MaterialColors.getColor(this,
+                com.google.android.material.R.attr.colorPrimaryContainer, 0xFF394B63));
+        content.addView(imageTitle, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(52)));
 
-            FrameLayout imageContainer = new FrameLayout(this);
-            imageContainer.setClipChildren(false);
-            imageContainer.setClipToPadding(false);
-            content.addView(imageContainer, new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+        FrameLayout imageContainer = new FrameLayout(this);
+        imageContainer.setClipChildren(false);
+        imageContainer.setClipToPadding(false);
+        content.addView(imageContainer, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
-            ImageView image = new ImageView(this);
-            image.setBackgroundColor(Color.BLACK);
-            image.setScaleType(ImageView.ScaleType.FIT_CENTER);
-            image.setAdjustViewBounds(true);
-            image.setFocusable(true);
-            image.setFocusableInTouchMode(false);
-            imageContainer.addView(image, new FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
-                    Gravity.CENTER));
+        ImageView image = new ImageView(this);
+        image.setBackgroundColor(Color.BLACK);
+        image.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        image.setAdjustViewBounds(true);
+        image.setFocusable(true);
+        image.setFocusableInTouchMode(false);
+        imageContainer.addView(image, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+                Gravity.CENTER));
 
-            Dialog dialog = new Dialog(this);
-            dialog.setContentView(content);
-            dialog.setCanceledOnTouchOutside(false);
-            dialog.setOnKeyListener((dialogInterface, keyCode, event) -> {
-                if (event.getAction() != KeyEvent.ACTION_DOWN || event.getRepeatCount() > 0) return false;
-                if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER
-                        || keyCode == KeyEvent.KEYCODE_ENTER
-                        || keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER) {
-                    toggleImageFullscreen(dialog, imageTitle);
+        Dialog dialog = new Dialog(this);
+        dialog.setContentView(content);
+        dialog.setCanceledOnTouchOutside(false);
+        ImagePager pager = new ImagePager(dialog, imageTitle, image, imageContainer, pages, index);
+
+        dialog.setOnKeyListener((dialogInterface, keyCode, event) -> {
+            if (event.getAction() != KeyEvent.ACTION_DOWN || event.getRepeatCount() > 0) return false;
+            switch (keyCode) {
+                case KeyEvent.KEYCODE_DPAD_CENTER:
+                case KeyEvent.KEYCODE_ENTER:
+                case KeyEvent.KEYCODE_NUMPAD_ENTER:
+                    pager.toggleFullscreen(false);
                     return true;
-                }
-                return false;
-            });
-            image.setOnClickListener(v -> {
-                if (isTvDevice()) {
-                    toggleImageFullscreen(dialog, imageTitle);
-                } else if (getResources().getDisplayMetrics().widthPixels
-                        >= getResources().getDisplayMetrics().heightPixels) {
-                    toggleImageFullscreen(dialog, imageTitle);
+                case KeyEvent.KEYCODE_DPAD_LEFT:
+                case KeyEvent.KEYCODE_PAGE_UP:
+                    pager.step(-1);
+                    return true;
+                case KeyEvent.KEYCODE_DPAD_RIGHT:
+                case KeyEvent.KEYCODE_PAGE_DOWN:
+                    pager.step(1);
+                    return true;
+                default:
+                    return false;
+            }
+        });
+        // 手机竖屏：左右各三分之一翻页，中间进入/退出全屏；横屏时不用旋转图片，直接全屏横看。
+        image.setOnClickListener(v -> {
+            if (isTvDevice()) {
+                pager.toggleFullscreen(false);
+                return;
+            }
+            float x = v.getWidth() <= 0 ? 0 : lastTouchX / v.getWidth();
+            if (x < 0.34f) {
+                pager.step(-1);
+            } else if (x > 0.66f) {
+                pager.step(1);
+            } else {
+                pager.toggleFullscreen(true);
+            }
+        });
+        image.setOnTouchListener((v, event) -> {
+            lastTouchX = event.getX();
+            return false;
+        });
+        dialog.setOnShowListener(ignored -> {
+            Window window = dialog.getWindow();
+            if (window != null) {
+                window.setBackgroundDrawableResource(android.R.color.transparent);
+                window.setLayout(
+                        (int) (getResources().getDisplayMetrics().widthPixels * 0.92f),
+                        (int) (getResources().getDisplayMetrics().heightPixels * 0.84f));
+            }
+            image.requestFocus();
+        });
+        dialog.setOnDismissListener(ignored -> pager.restoreOrientation());
+        pager.bind();
+        dialog.show();
+    }
+
+    /** 翻页范围：正常浏览时是当前目录里的图片，从收藏夹打开时是收藏夹里的图片。 */
+    private List<String> imagePages(String remotePath) {
+        if (pendingImagePages != null) {
+            List<String> pending = pendingImagePages;
+            pendingImagePages = null;
+            return pending;
+        }
+        List<String> pages = new ArrayList<>();
+        if (showingFavorites) {
+            // 收藏项按 "host\nshare\npath\nD|F" 存；只取同一主机同一共享下的非目录图片，
+            // 避免把别的共享里的图片混进翻页范围。
+            for (String value : favorites) {
+                String[] parts = value.split("\n", 4);
+                if (parts.length != 4 || parts[3].equals("D")) continue;
+                if (!parts[0].equals(host) || !parts[1].equals(share)) continue;
+                if (SmbClient.isImage(parts[2])) pages.add(parts[2]);
+            }
+            return pages;
+        }
+        String folder = remotePath.lastIndexOf((char) 92) > 0 ? remotePath.substring(0, remotePath.lastIndexOf((char) 92)) : "";
+        for (SmbClient.Entry entry : visibleFiles) {
+            if (entry.directory) continue;
+            String candidate = folder.isEmpty() ? entry.name : folder + "\\" + entry.name;
+            if (SmbClient.isImage(candidate) && !isHiddenFolder(candidate)) pages.add(candidate);
+        }
+        return pages;
+    }
+
+    /** 图片预览的翻页与全屏状态：电视左右键/手机左右三分之一点翻页，全屏在手机上真横屏，退出还原方向。 */
+    private final class ImagePager {
+
+        private final Dialog dialog;
+        private final TextView imageTitle;
+        private final ImageView image;
+        private final FrameLayout container;
+        private final List<String> pages;
+        private int index;
+        private boolean landscape;
+        private int savedOrientation = Integer.MIN_VALUE;
+
+        ImagePager(Dialog dialog, TextView imageTitle, ImageView image, FrameLayout container,
+                   List<String> pages, int index) {
+            this.dialog = dialog;
+            this.imageTitle = imageTitle;
+            this.image = image;
+            this.container = container;
+            this.pages = pages;
+            this.index = index;
+        }
+
+        void bind() {
+            image.setRotation(0f);
+            image.setLayoutParams(new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.CENTER));
+            String path = pages.get(index);
+            String name = path.substring(path.lastIndexOf((char) 92) + 1);
+            imageTitle.setText(pages.size() > 1 ? (index + 1) + "/" + pages.size() + "  " + name : name);
+            try {
+                String url = SmbPlaybackProxy.createUrl(host, share, path, username, password, domain);
+                Glide.with(SmbBrowserActivity.this)
+                        .load(url)
+                        .override(getResources().getDisplayMetrics().widthPixels,
+                                getResources().getDisplayMetrics().heightPixels)
+                        .downsample(DownsampleStrategy.AT_MOST)
+                        .placeholder(android.R.drawable.ic_menu_gallery)
+                        .error(android.R.drawable.ic_menu_report_image)
+                        .fitCenter()
+                        .into(image);
+            } catch (Exception e) {
+                Toast.makeText(SmbBrowserActivity.this,
+                        getString(R.string.smb_connect_failed) + "：" + shortError(e), Toast.LENGTH_LONG).show();
+            }
+        }
+
+        void step(int delta) {
+            int target = index + delta;
+            if (target < 0) {
+                Toast.makeText(SmbBrowserActivity.this, "已经是第一张", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            if (target >= pages.size()) {
+                Toast.makeText(SmbBrowserActivity.this, "已经是最后一张", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            index = target;
+            bind();
+        }
+
+        /** 进入或退出全屏；phoneLandscape 为真时手机上顺便切成横屏（退出时还原原方向）。 */
+        void toggleFullscreen(boolean phoneLandscape) {
+            boolean fullscreen = imageTitle.getVisibility() == View.VISIBLE;
+            toggleImageFullscreen(dialog, imageTitle);
+            if (isTvDevice()) return;
+            if (fullscreen) {
+                if (phoneLandscape) enterLandscape();
+            } else {
+                restoreOrientation();
+            }
+            if (fullscreen) fitWindow(true);
+            else fitWindow(false);
+        }
+
+        private void enterLandscape() {
+            if (landscape) return;
+            savedOrientation = getRequestedOrientation();
+            landscape = true;
+            setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+        }
+
+        void restoreOrientation() {
+            if (!landscape) return;
+            landscape = false;
+            if (savedOrientation != Integer.MIN_VALUE) setRequestedOrientation(savedOrientation);
+            savedOrientation = Integer.MIN_VALUE;
+        }
+
+        private void fitWindow(boolean fullscreen) {
+            Window window = dialog.getWindow();
+            if (window == null) return;
+            container.post(() -> {
+                if (!dialog.isShowing()) return;
+                if (fullscreen) {
+                    window.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
                 } else {
-                    togglePhoneImageRotation(dialog, imageTitle, image, imageContainer);
-                }
-            });
-            dialog.setOnShowListener(ignored -> {
-                Window window = dialog.getWindow();
-                if (window != null) {
-                    window.setBackgroundDrawableResource(android.R.color.transparent);
                     window.setLayout(
                             (int) (getResources().getDisplayMetrics().widthPixels * 0.92f),
                             (int) (getResources().getDisplayMetrics().heightPixels * 0.84f));
                 }
-                image.requestFocus();
             });
-            dialog.show();
-
-            Glide.with(this)
-                    .load(url)
-                    .override(getResources().getDisplayMetrics().widthPixels,
-                            getResources().getDisplayMetrics().heightPixels)
-                    .downsample(DownsampleStrategy.AT_MOST)
-                    .placeholder(android.R.drawable.ic_menu_gallery)
-                    .error(android.R.drawable.ic_menu_report_image)
-                    .fitCenter()
-                    .into(image);
-        } catch (Exception e) {
-            Toast.makeText(this, getString(R.string.smb_connect_failed) + "：" + shortError(e), Toast.LENGTH_LONG).show();
         }
-    }
-
-    private void togglePhoneImageRotation(Dialog dialog, TextView imageTitle,
-                                          ImageView image, FrameLayout container) {
-        if (image.getRotation() != 0f) {
-            image.setRotation(0f);
-            image.setLayoutParams(new FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    Gravity.CENTER));
-            toggleImageFullscreen(dialog, imageTitle);
-            return;
-        }
-
-        // 竖屏点击旋转时同步进入全屏，第二次点击恢复原图并退出全屏。
-        toggleImageFullscreen(dialog, imageTitle);
-        image.setRotation(90f);
-        container.post(() -> {
-            if (!dialog.isShowing() || image.getRotation() == 0f) return;
-            int width = container.getWidth();
-            int height = container.getHeight();
-            if (width <= 0 || height <= 0) return;
-            image.setLayoutParams(new FrameLayout.LayoutParams(height, width, Gravity.CENTER));
-        });
     }
 
     private void toggleImageFullscreen(Dialog dialog, TextView imageTitle) {
@@ -1440,6 +2001,13 @@ public class SmbBrowserActivity extends AppCompatActivity {
                 int cut = path.lastIndexOf('\\');
                 path = cut < 0 ? "" : path.substring(0, cut);
                 loadDirectory();
+            } else if (isOwnShareHost(host)) {
+                // 自家分享不走共享枚举，这里没有 share 列表可回，直接回主机列表。
+                mode = Mode.HOSTS;
+                title.setText(getString(R.string.smb_browser_title));
+                setItems(hostLabels());
+                setStatus(hosts.isEmpty() ? getString(R.string.smb_no_servers)
+                        : getString(R.string.smb_server_count, hosts.size()));
             } else {
                 mode = Mode.SHARES;
                 title.setText(host);

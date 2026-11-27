@@ -50,8 +50,6 @@ public class SiteAdapter extends RecyclerView.Adapter<SiteAdapter.ViewHolder> {
         void onItemClick(Site item);
 
         boolean onItemKeyUp(int position);
-
-        boolean onItemKeyHorizontal(int position, boolean left);
     }
 
     public interface OnDeleteListener {
@@ -175,7 +173,7 @@ public class SiteAdapter extends RecyclerView.Adapter<SiteAdapter.ViewHolder> {
     }
 
     private boolean setLongListener(Site item) {
-        if (type == 0 && item.isFile() && listener instanceof OnDeleteListener) {
+        if (type == 0 && (item.isFile() || item.isIdjPlugin()) && listener instanceof OnDeleteListener) {
             ((OnDeleteListener) listener).onDelete(item);
             return true;
         }
@@ -270,15 +268,9 @@ public class SiteAdapter extends RecyclerView.Adapter<SiteAdapter.ViewHolder> {
         }
 
         private boolean onKey(int keyCode, android.view.KeyEvent event) {
-            boolean left = keyCode == android.view.KeyEvent.KEYCODE_DPAD_LEFT;
-            boolean right = keyCode == android.view.KeyEvent.KEYCODE_DPAD_RIGHT;
-            if (keyCode != android.view.KeyEvent.KEYCODE_DPAD_UP && !left && !right) return false;
+            if (keyCode != android.view.KeyEvent.KEYCODE_DPAD_UP) return false;
             int position = getBindingAdapterPosition();
             if (position == RecyclerView.NO_POSITION) return false;
-            if (left || right) {
-                if (event.getAction() != android.view.KeyEvent.ACTION_DOWN) return false;
-                return listener.onItemKeyHorizontal(position, left);
-            }
             if (event.getAction() != android.view.KeyEvent.ACTION_DOWN) return false;
             return listener.onItemKeyUp(position);
         }

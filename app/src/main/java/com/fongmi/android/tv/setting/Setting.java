@@ -47,6 +47,7 @@ import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 
 public class Setting {
 
@@ -1768,6 +1769,23 @@ public class Setting {
         Prefers.put("search_result_sort", sort == 0 ? 0 : 1);
     }
 
+    /** 搜索作用域：记忆上一次选的“当前站 / 分组”，下次进搜索页不再是“全部”。 */
+    public static boolean isSearchScopeCurrent() {
+        return Prefers.getBoolean("search_scope_current", false);
+    }
+
+    public static void putSearchScopeCurrent(boolean current) {
+        Prefers.put("search_scope_current", current);
+    }
+
+    public static String getSearchScopeGroup() {
+        return Objects.toString(Prefers.getString("search_scope_group", ""), "");
+    }
+
+    public static void putSearchScopeGroup(String group) {
+        Prefers.put("search_scope_group", Objects.toString(group, ""));
+    }
+
     public static int getSearchSimilarity() {
         return Prefers.getInt("search_similarity", 30);
     }
@@ -1796,6 +1814,24 @@ public class Setting {
         if (blocked) mask |= source;
         else mask &= ~source;
         putSourceBlockMask(mask);
+    }
+
+    /** iDuanJu 插件站点独立开关（含成人插件）：与 sites-js 分开，默认开启。 */
+    public static boolean isIdjSitesEnabled() {
+        return Prefers.getBoolean("idj_sites_enabled", true);
+    }
+
+    public static void putIdjSitesEnabled(boolean enabled) {
+        Prefers.put("idj_sites_enabled", enabled);
+    }
+
+    /** iDuanJu 成人插件独立开关：默认屏蔽（不允许），单独于站点开关与来源屏蔽掩码。 */
+    public static boolean isIdjAdultAllowed() {
+        return Prefers.getBoolean("idj_allow_adult", false);
+    }
+
+    public static void putIdjAdultAllowed(boolean allow) {
+        Prefers.put("idj_allow_adult", allow);
     }
 
     public static int getSourceBlockedCount() {
@@ -1833,5 +1869,15 @@ public class Setting {
 
     public static void putSmbEntryEnabled(boolean enabled) {
         Prefers.put("smb_entry_enabled", enabled);
+    }
+
+    // ===== 首页搜索按钮：单击/长按分工 =====
+    /** true=单击搜索、长按语音遥控（默认，保持老习惯）；false=单击语音遥控、长按搜索。 */
+    public static boolean isVoiceSearchLongPress() {
+        return Prefers.getBoolean("voice_search_long_press", true);
+    }
+
+    public static void putVoiceSearchLongPress(boolean longPress) {
+        Prefers.put("voice_search_long_press", longPress);
     }
 }

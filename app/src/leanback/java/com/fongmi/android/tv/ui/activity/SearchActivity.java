@@ -90,6 +90,16 @@ public class SearchActivity extends BaseActivity implements WordAdapter.OnClickL
         start(activity, keyword, siteKey, null, null);
     }
 
+    /** 语音搜索入口：复用已有的搜索页（singleTop + onNewIntent），并压掉上面的播放页/列表页。 */
+    public static void startFresh(Activity activity, String keyword) {
+        // 语音搜索：关掉上面堆着的播放页/列表页，只留搜索页自己（复用实例重查）
+        com.fongmi.android.tv.App.finishPagesExcept(SearchActivity.class.getName());
+        Intent intent = new Intent(activity, SearchActivity.class);
+        intent.putExtra("keyword", keyword);
+        intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        activity.startActivity(intent);
+    }
+
     public static void start(Activity activity, String keyword, String siteKey, String pic, String wallPic) {
         Intent intent = new Intent(activity, SearchActivity.class);
         intent.putExtra("keyword", keyword);
@@ -152,9 +162,27 @@ public class SearchActivity extends BaseActivity implements WordAdapter.OnClickL
 
     @Override
     protected void initView(Bundle savedInstanceState) {
-        mCurrentSite = !TextUtils.isEmpty(getSiteKey());
+        // 上次选的作用域留下来，别每次都回到“全部”。
+        mCurrentSite = !TextUtils.isEmpty(getSiteKey()) || Setting.isSearchScopeCurrent();
+        mScopeGroup = mCurrentSite ? "" : Setting.getSearchScopeGroup();
+        if (mCurrentSite && getHome().isEmpty()) mCurrentSite = false;
         CustomKeyboard.init(this, mBinding);
         setRecyclerView();
+        checkKeyword();
+        setSearchScope();
+        onSearch();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        // 连续语音搜索：同一个搜索页换关键词重查，不再叠页。
+        // 新 intent 没带 siteKey 时保留用户记住的作用域，不要打回“全部”。
+        if (!TextUtils.isEmpty(getSiteKey())) {
+            mCurrentSite = true;
+            mScopeGroup = "";
+        }
         checkKeyword();
         setSearchScope();
         onSearch();
@@ -393,6 +421,9 @@ public class SearchActivity extends BaseActivity implements WordAdapter.OnClickL
     private void selectScope(boolean current, String group, PopupWindow popup) {
         mCurrentSite = current;
         mScopeGroup = group;
+        // 记住作用域；下次进来按这次选的来。
+        Setting.putSearchScopeCurrent(mCurrentSite);
+        Setting.putSearchScopeGroup(mScopeGroup);
         setSearchScope();
         popup.dismiss();
     }

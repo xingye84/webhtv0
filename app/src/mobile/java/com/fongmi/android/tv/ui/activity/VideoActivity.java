@@ -116,6 +116,7 @@ import com.fongmi.android.tv.player.PlaybackExperimentPolicy;
 import com.fongmi.android.tv.player.PlaybackResourceClassifier;
 import com.fongmi.android.tv.player.PlayerHelper;
 import com.fongmi.android.tv.player.PlayerManager;
+import com.fongmi.android.tv.player.TrickplayStore;
 import com.fongmi.android.tv.player.engine.PlayerEngine;
 import com.fongmi.android.tv.player.engine.PlaySpec;
 import com.fongmi.android.tv.player.lut.LutPreset;
@@ -154,6 +155,7 @@ import com.fongmi.android.tv.ui.adapter.TmdbRecommendationAdapter;
 import com.fongmi.android.tv.ui.audio.AudioPlaybackResolver;
 import com.fongmi.android.tv.ui.base.ViewType;
 import com.fongmi.android.tv.ui.custom.CustomKeyDown;
+import com.fongmi.android.tv.ui.custom.SeekPreviewStrip;
 import com.fongmi.android.tv.ui.custom.CustomMovement;
 import com.fongmi.android.tv.ui.custom.CustomSeekView;
 import com.fongmi.android.tv.ui.custom.PlayerOsdController;
@@ -224,7 +226,6 @@ import org.greenrobot.eventbus.ThreadMode;
 import java.io.File;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -462,6 +463,16 @@ private int mAudioBackgroundRandomNonce;
     private androidx.appcompat.app.AlertDialog mIntroSkipConfirmDialog;
     private ValueAnimator mAnimator;
     private CustomKeyDown mKeyDown;
+    /** 横滑快进/快退时的缩略图预览层（与电视端同一实现）。 */
+    private SeekPreviewStrip mSeekPreview;
+    private long mSeekPreviewBase;
+    private long mSeekPreviewOffset;
+    private boolean mSeekPreviewPending;
+    /** 同上（电视端）：一排图只对应一次按住，松手即结束；下一段要重新取起点。 */
+    private boolean mSeekPreviewSessionStarted;
+    private java.util.Map<String, String> mSeekPreviewHeaders;
+    private final android.os.Handler mSeekPreviewHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    private final Runnable mSeekPreviewShow = this::showPendingSeekPreview;
     private View mNightModeOverlay;
     private int mNightModeLevel = PlayerSetting.NIGHT_MODE_OFF;
     private List<String> mBroken;
@@ -624,14 +635,11 @@ private int mAudioBackgroundRandomNonce;
     private int followingUiGeneration;
     private boolean followingActionPending;
     private long playerStartTime;
-    private long pendingResumeSeekMs = C.TIME_UNSET;
+    /** 点缩略图刚跳过的目标点，用于 0.9 秒后复核补跳。 */
+    private long previewCommitTarget = C.TIME_UNSET;
     private boolean tmdbHistoryResumePending;
-    private final List<ShortDramaControlItem> mShortDramaControlItems = new ArrayList<>();
-    private ViewGroup mShortDramaControlDock;
-    private boolean shortDramaControlsDocked;
     private boolean shortDramaSession;
     /** setQualityVisible 最近一次的结论，供短剧 dock 图标复用，避免两个真值来源。 */
-    private boolean mQualityVisible;
 
     // TMDB 模式相关字段
     private com.fongmi.android.tv.ui.helper.TmdbUIAdapter mTmdbUIAdapter;
@@ -826,8 +834,18 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
     }
 
     public static void startDirectResolved(Activity activity, Vod vod) {
+        startDirectResolved(activity, vod, false);
+    }
+
+    /**
+     * @param collapse true 时压掉堆在上面的搜索页/详情页，语音点播只留首页 → 播放页，返回一次就退出。
+     */
+    public static void startDirectResolved(Activity activity, Vod vod, boolean collapse) {
         if (activity == null || vod == null) return;
-        Intent intent = new Intent(activity, VideoActivity.class);
+        // 语音点播：先关掉上面堆着的搜索/详情/直播页（本页保留，靠 onNewIntent 换片）
+        if (collapse) App.finishPagesExcept(VideoActivity.class.getName());
+        Intent intent = new Intent(collapse ? App.get() : activity, VideoActivity.class);
+        if (collapse) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
         intent.putExtra("detail_mode", Setting.DETAIL_OPEN_DIRECT);
         intent.putExtra(EXTRA_DETAIL_RUNTIME_MODE, Setting.DETAIL_OPEN_DIRECT);
         intent.putExtra("scan", false);
@@ -840,7 +858,7 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         intent.putExtra("mark", vod.getRemarks());
         intent.putExtra("content", vod.getContent());
         putDetailVodCache(intent, vod);
-        activity.startActivity(intent);
+        (collapse ? App.get() : activity).startActivity(intent);
     }
 
     public static void start(Activity activity, String url) {
@@ -1664,7 +1682,6 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
 
         long position = Math.max(mHistory.getOpening(), mHistory.getPosition());
         if (position > 0) {
-            pendingResumeSeekMs = position;
             tmdbHistoryResumePending = true;
         }
         if (!targetFlag.isSelected() || !targetEpisode.isSelected()) {
@@ -1677,7 +1694,7 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         alignHistoryWithSelectedEpisode(targetFlag, targetEpisode);
         if (position > 0) {
             setPosition();
-            applyPendingResumeSeek();
+            seekToResumePosition(position);
         }
     }
 
@@ -1894,6 +1911,7 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         mRestoringConfigurationPlayback = savedInstanceState != null;
         ViewCompat.setOnApplyWindowInsetsListener(mBinding.getRoot(), (v, insets) -> setStatusBar(insets));
         mKeyDown = CustomKeyDown.create(this, mBinding.exo);
+        setupSeekPreview();
         mFrameParams = mBinding.video.getLayoutParams();
         mFrameHeight = mFrameParams.height;
         if (mFrameParams instanceof RelativeLayout.LayoutParams params) mDefaultFrameParams = new RelativeLayout.LayoutParams(params);
@@ -1938,7 +1956,8 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         else mBinding.progressLayout.showProgress();
         setAnimator();
         initNightModeOverlay();
-        if (isShortDramaSession()) enterShortDramaFullscreen();
+        // 短剧源不再一进页面就强制竖屏全屏：此时画面尺寸还没拿到，方向按「是不是短剧」判会把
+        // 横屏短剧也转成竖屏。方向统一等到 STATE_READY 拿到画面比例后再定。
         if (hasPendingImmersiveAudioLaunch()) setAudioStageVisible(true);
         setupIntroSkipConfirmListener();
     }
@@ -2007,9 +2026,6 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         mBinding.control.right.rotate.setOnClickListener(view -> onRotate());
         mBinding.control.right.pip.setOnClickListener(guarded(this::onPiP));
         mBinding.control.fullscreen.setOnClickListener(guarded(this::onFullscreen));
-        mBinding.control.shortDramaChangeSource.setOnClickListener(view -> onChange());
-        mBinding.control.shortDramaQuality.setOnClickListener(guarded(this::onQuality));
-        mBinding.control.shortDramaEpisodes.setOnClickListener(guarded(this::onEpisodes));
         mBinding.control.action.text.setOnClickListener(guardedView(this::onTrack));
         mBinding.control.action.audio.setOnClickListener(guardedView(this::onTrack));
         mBinding.control.action.video.setOnClickListener(guardedView(this::onTrack));
@@ -2079,7 +2095,100 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         mBinding.swipeLayout.setOnRefreshListener(this::onSwipeRefresh);
     }
 
-    private WindowInsetsCompat setStatusBar(WindowInsetsCompat insets) {
+private void setupSeekPreview() {
+        if (mSeekPreview != null) return;
+        mSeekPreview = new SeekPreviewStrip(this);
+        mSeekPreview.setListener(new SeekPreviewStrip.Listener() {
+            @Override
+            public void onCommit(long positionMs) {
+                SpiderDebug.log("playback", "preview-commit target=%d pos=%d canSeek=%b", positionMs,
+                        player() == null ? -1 : player().getPosition(), canPreviewSeek());
+                if (!canPreviewSeek()) return;
+                boolean wasPlaying = player() != null && player().isPlaying();
+                onSeekStarted();
+                markPreviewSeek(positionMs);
+                pinSeekDisplay(positionMs);
+                // 先停掉正在跑的补帧会话，把 SMB 连接让给这次跳转；否则抽帧和 seek 抢同一条连接，
+                // 表现就是「卡的时候点略图不跳」。
+                com.fongmi.android.tv.player.TrickplayStore.cancelAll();
+                controller().seekTo(positionMs);
+                controller().play();
+                // 点略图跳过去后必须继续播：起播/long-press 收尾那条路径可能把播放状态压回暂停，
+                // 这里在跳转后补一次确认，只在“点之前本来在播”时才补，不把用户主动暂停弄成自动播。
+                if (wasPlaying) App.post(() -> {
+                    try {
+                        if (player() != null && !player().isPlaying()) {
+                            controller().play();
+                            SpiderDebug.log("playback", "preview-commit resume state=replay");
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }, 900L);
+                logSeekVerify(positionMs);
+                previewCommitTarget = positionMs;
+                App.post(() -> retryPreviewCommitIfNeeded(positionMs), 900L);
+            }
+
+            @Override
+            public void onDismiss() {
+            }
+        });
+        mSeekPreview.setOnTouchListener((view, event) -> mSeekPreview.handleTouch(event));
+        android.view.ViewGroup content = findViewById(android.R.id.content);
+        if (content == null) return;
+        android.widget.FrameLayout.LayoutParams params = new android.widget.FrameLayout.LayoutParams(
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT);
+        content.addView(mSeekPreview, params);
+    }
+
+    /**
+     * 手机上也是「拖起来才出图」：位移超过一点距离或持续超过 450ms 才弹预览层，
+     * 轻点屏幕不会闪一排缩略图。
+     */
+    private void driveSeekPreview(long offsetMs) {
+        if (mSeekPreview == null) return;
+        // 只在全屏下弹预览条：竖屏/半屏拖动条上不该盖一排图。
+        if (!isFullscreen()) return;
+        // 网络源不抽帧：保持原来的双箭头快进/快退，不弹预览条。
+        if (!com.fongmi.android.tv.player.TrickplayStore.supports(player().getUrl())) return;
+        // 上一排还在停留窗口里就开始新一次拖动：它记的是上一段的起点，先收掉重新定位。
+        if (mSeekPreview.isActive() && !mSeekPreviewSessionStarted) {
+            cancelPendingSeekPreview();
+            mSeekPreview.dismiss();
+        }
+        mSeekPreviewSessionStarted = true;
+        mSeekPreviewOffset = offsetMs;
+        if (!mSeekPreview.isActive()) {
+            if (!mSeekPreviewPending) {
+                mSeekPreviewBase = Math.max(0, player().getPosition());
+                mSeekPreviewHeaders = player().getHeaders();
+                mSeekPreviewPending = true;
+                mSeekPreviewHandler.postDelayed(mSeekPreviewShow, 450L);
+            }
+            return;
+        }
+        mSeekPreview.update(mSeekPreviewBase + offsetMs, (int) Math.signum(offsetMs));
+    }
+
+    private void showPendingSeekPreview() {
+        if (!mSeekPreviewPending || mSeekPreview == null) return;
+        mSeekPreviewPending = false;
+        if (!canPreviewSeek()) return;
+        mSeekPreview.begin(player().getDuration(), mSeekPreviewBase + mSeekPreviewOffset,(int) Math.signum(mSeekPreviewOffset),
+                player().getUrl(), mSeekPreviewHeaders);
+    }
+
+    private boolean canPreviewSeek() {
+        return service() != null && !isFinishing() && !isDestroyed() && !player().isEmpty();
+    }
+
+    private void cancelPendingSeekPreview() {
+        mSeekPreviewHandler.removeCallbacks(mSeekPreviewShow);
+        mSeekPreviewPending = false;
+    }
+
+        private WindowInsetsCompat setStatusBar(WindowInsetsCompat insets) {
         int top = insets.getInsets(WindowInsetsCompat.Type.statusBars()).top;
         Insets nav = insets.getInsets(WindowInsetsCompat.Type.navigationBars());
         int bottom = nav.bottom;
@@ -2624,13 +2733,12 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
 
     /**
      * 起播前把内核切到本剧记住的选择，并返回该内核给取址用——取播放地址要按内核区分线路。
-     * 没有记录时 getPlayerOrDefault 会退回设置页的全局默认。
+     * 记住的内核只对当前线路自己的记录生效；跨源聚合来的记录回落到设置页的全局默认。
+     * 老容器（AVI/WMV/RMVB 等）Exo 没有解复用器，记忆里是 EXO 也要改走 IJK，避免总时长 0/黑屏。
      * 播放服务还没连上时先只记会话内核（取址在工作线程上读它），引擎由 onServiceConnected 补齐。
      */
     private int applyHistoryPlayerKernel(String sourceUrl, boolean forcePrepare) {
-        int kernel = mHistory == null ? PlayerSetting.getPlayer() : mHistory.getPlayerOrDefault();
-        // 老容器（AVI/WMV/RMVB 等）Exo 没有解复用器；即使历史里存的是 EXO（旧版本默认值
-        // 或此前误选），也不能让 EXO 接住，自动改走带 FFmpeg 的 IJK，避免总时长 0/黑屏。
+        int kernel = mHistory == null ? PlayerSetting.getPlayer() : mHistory.getPlaybackPlayerOrDefault(kernelFlag());
         // 本地 /file 代理地址正常带原后缀；若被编码/截断丢了后缀，再用当前文件名兜底判断。
         boolean legacyContainer = PlayerSetting.isLegacyContainer(sourceUrl)
                 || PlayerSetting.isLegacyContainer(getName());
@@ -2659,8 +2767,15 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         return applyHistoryPlayerKernel(null, forcePrepare);
     }
 
+    /** 调用点手上只有 URL，用它做老容器判断。 */
     private int applyHistoryPlayerKernel(String sourceUrl) {
         return applyHistoryPlayerKernel(sourceUrl, false);
+    }
+
+    /** 当前线路名：内核记忆按线路存，读写都必须带它。 */
+    private String kernelFlag() {
+        Flag flag = getFlag();
+        return flag == null ? "" : flag.getFlag();
     }
 
     /**
@@ -2685,9 +2800,9 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
      * 上一部剧的收尾存档会用别人的会话内核覆盖本剧记住的选择；
      * 而引擎类型还会被播放失败后的自动回退改掉，也不代表用户改了选择。
      */
-    private void rememberPlayerKernel(int type) {
+    private void rememberPlayerKernel(String flag, int type) {
         if (mHistory == null || !PlayerSetting.isPlayer(type)) return;
-        mHistory.setPlayer(type);
+        mHistory.setKernelForFlag(flag, type);
         syncHistory();
     }
 
@@ -3309,7 +3424,7 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
                 || !player().supportsPlaylistQueue() || !PreloadSetting.isPreload(PlayerSetting.EXO)) return false;
         if (MultiThreadProxySetting.get().enabled() || player().isRepeatOne() || mHistory == null
                 || mHistory.getOpening() > 0 || mHistory.getEnding() > 0
-                || pendingResumeSeekMs != C.TIME_UNSET || tmdbHistoryResumePending
+                || tmdbHistoryResumePending
                 || isAudioOnly() || shouldUseImmersiveAudio()) return false;
         Flag flag = getFlag();
         if (flag == null || flag.getEpisodes().size() < 2 || result == null || result.hasMsg()
@@ -3833,9 +3948,9 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         updateEpisodeSeasonContext();
         int size = items.size();
         boolean useTmdbCard = shouldUseTmdbEpisodeCards(items);
-        mBinding.control.action.episodes.setVisibility(size < 2 ? View.GONE : View.VISIBLE);
-        mBinding.control.action.next.setVisibility(size < 2 ? View.GONE : View.VISIBLE);
-        mBinding.control.action.prev.setVisibility(size < 2 ? View.GONE : View.VISIBLE);
+        PlayerButtonSetting.apply(mBinding.control.action.episodes, PlayerButtonSetting.EPISODES, size >= 2);
+        PlayerButtonSetting.apply(mBinding.control.action.next, PlayerButtonSetting.NEXT, size >= 2);
+        PlayerButtonSetting.apply(mBinding.control.action.prev, PlayerButtonSetting.PREV, size >= 2);
         applyActionButtonVisibility();
         // 中间悬浮的上集/下集按钮只根据集数显示，不受底部动作栏设置影响。
         mBinding.control.next.setVisibility(size < 2 ? View.GONE : View.VISIBLE);
@@ -4080,16 +4195,11 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
     }
 
     private void setQualityVisible(boolean visible) {
-        mQualityVisible = visible;
         mBinding.qualityText.setVisibility(visible ? View.VISIBLE : View.GONE);
         mBinding.quality.setVisibility(visible ? View.VISIBLE : View.GONE);
-        mBinding.control.action.actionQuality.setVisibility(visible ? View.VISIBLE : View.GONE);
+        PlayerButtonSetting.apply(mBinding.control.action.actionQuality, PlayerButtonSetting.QUALITY, visible);
         applyActionButtonVisibility();
         updateActionQuality(mViewModel.getPlayer().getValue());
-        // 短剧 dock 的画质图标与 action 栏按钮同源。未 dock 时这个图标还在顶部栏里，
-        // 此时置 VISIBLE 会让非短剧场景多出一个图标，所以只在已 dock 时同步。
-        // dock 建立时会由 syncShortDramaControlLayout 用 mQualityVisible 补齐。
-        if (shortDramaControlsDocked) mBinding.control.shortDramaQuality.setVisibility(visible ? View.VISIBLE : View.GONE);
     }
 
     private void updateActionQuality(Result result) {
@@ -4358,6 +4468,12 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
 
     private void onKeep() {
         Keep keep = Keep.find(getHistoryKey());
+        // 详情回调（setDetail -> checkHistory）之前 mHistory 还是 null，此时新增收藏会拿空历史当对象用。
+        // 取消收藏只依赖 key，与详情是否就绪无关，因此只挡新增这一支。
+        if (keep == null && !isKeepReady()) {
+            Notify.show(R.string.keep_not_ready);
+            return;
+        }
         Notify.show(keep != null ? R.string.keep_del : R.string.keep_add);
         if (keep != null) keep.delete();
         else createKeep();
@@ -5825,6 +5941,8 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         if (mBinding == null || mHistory == null) return;
         mBinding.control.action.opening.setText(openingLabel());
         mBinding.control.action.ending.setText(endingLabel());
+        // 屏显左下角的总时长跟着扣掉手设的片尾；没设/不匹配时这里传 0，照真实片长显示。
+        if (mOsd != null) mOsd.setEnding(mHistory.getEnding());
     }
 
     private String openingLabel() {
@@ -5900,7 +6018,7 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
                     player().switchPlayerManually(which);
                     setPlayer();
                     setDecode();
-                    rememberPlayerKernel(which);
+                    rememberPlayerKernel(kernelFlag(), which);
                 }
             } else {
                 playerKernelSwitchRequestId++;
@@ -5973,7 +6091,7 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
             PlayerManager danmakuManager = player();
             String beforeTrace = danmakuManager.getPlaybackTraceId();
             player().switchPlayer(type, result, activePlaybackKey(), metadata, isUseParse(), position, speed, repeat);
-            rememberPlayerKernel(type);
+            rememberPlayerKernel(flag, type);
             searchAutoDanmaku(result, danmakuManager, beforeTrace);
         }
         setPlayerKernel();
@@ -6224,7 +6342,7 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         boolean shortDrama = isShortDramaSession();
         boolean showPiP = canShowPiP(shortDrama);
         hideWidgetOverlay();
-        mBinding.control.setting.setVisibility(mHistory == null || (isFullscreen() && !shortDrama) ? View.GONE : View.VISIBLE);
+        mBinding.control.setting.setVisibility(mHistory == null || isFullscreen() ? View.GONE : View.VISIBLE);
         mBinding.control.right.getRoot().setVisibility(isFullscreen() || showPiP ? View.VISIBLE : View.GONE);
         mBinding.control.right.rotate.setVisibility(isFullscreen() && !isLock() ? View.VISIBLE : View.GONE);
         mBinding.control.right.pip.setVisibility(showPiP ? View.VISIBLE : View.GONE);
@@ -6241,12 +6359,10 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         mBinding.control.osdDiagnostics.setVisibility(PlayerSetting.isOsdDiagnostics() && showPlayParams && !player().isEmpty() ? View.VISIBLE : View.GONE);
         mBinding.control.osdDiagnostics.setAlpha(mOsd != null && mOsd.isDiagnosticsVisible() ? 1f : 0.72f);
         mBinding.control.parse.setVisibility(isFullscreen() && isUseParse() && PlayerButtonSetting.isVisible(PlayerButtonSetting.PARSE) ? View.VISIBLE : View.GONE);
-        // 竖屏模式下隐藏底部控制栏（EXO、硬解等选项），避免界面拥挤。
-        // 判定去耦：以视频方向（player().isPortrait()，即 App 期望的全屏方向）为主判据，
-        // 不再依赖系统 Configuration 何时真正旋转完成——否则慢机型会在 300ms 自动唤出时踩空、
-        // 锁定方向的机型会永久看不到控制台。ResUtil.isLand 作为额外兜底（竖屏视频被强制横屏时）。
-        boolean isLandscapeFullscreen = isFullscreen() && (!player().isPortrait() || ResUtil.isLand(this));
-        mBinding.control.action.getRoot().setVisibility(isLandscapeFullscreen || isFusionPlayerActionsDocked() ? View.VISIBLE : View.GONE);
+        // 控制栏按钮排：只要在播全屏（横屏/竖屏/短剧一视同仁）就给出同一排按钮
+        //（EXO/解码/比例/音轨/字幕/倍速/片头片尾/换源/画质/选集…），与电视端一致。
+        // 这一排本身是 HorizontalScrollView，竖屏窄也能横向滑动；小窗/内嵌（非全屏）保持隐藏。
+        mBinding.control.action.getRoot().setVisibility(isFullscreen() || isFusionPlayerActionsDocked() ? View.VISIBLE : View.GONE);
         mBinding.control.right.lock.setVisibility(isFullscreen() ? View.VISIBLE : View.GONE);
         mBinding.control.info.setVisibility(player().isEmpty() ? View.GONE : View.VISIBLE);
         // 顶部投屏图标只根据全屏和播放状态显示。
@@ -6255,7 +6371,6 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         mBinding.control.bottom.setVisibility(isLock() ? View.GONE : View.VISIBLE);
         mBinding.control.back.setVisibility(isLock() ? View.GONE : View.VISIBLE);
         mBinding.control.top.setVisibility(isLock() ? View.GONE : View.VISIBLE);
-        syncShortDramaControlLayout(shortDrama);
         mBinding.control.getRoot().setVisibility(View.VISIBLE);
         updateDiscMenuTools();
         updateCustomButtonVisibility();
@@ -6378,6 +6493,14 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         setArtwork(mHistory.getVodPic());
     }
 
+    /** SMB 缩略图写进历史后，详情背景也立刻换成这张，不再停在纸飞机占位。 */
+    @Override
+    protected void applyThumbnailArtwork(String uri) {
+        if (TextUtils.isEmpty(uri)) return;
+        if (mHistory != null) mHistory.setVodPic(uri);
+        setArtwork(uri);
+    }
+
     private void loadArtwork(String url) {
         loadArtwork(url, mPlaybackEpisodeKey);
     }
@@ -6419,15 +6542,22 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
     private String getContextWall() {
         if (!TextUtils.isEmpty(getWallPic())) return getWallPic();
         if (mHistory != null && !TextUtils.isEmpty(mHistory.getWallPic())) return mHistory.getWallPic();
-        if (mVod != null && !TextUtils.isEmpty(mVod.getPic())) return mVod.getPic();
+        // SMB 这类没有真实详情的条目，mVod.getPic() 一直是 push_image 占位（纸飞机）；
+        // 它排在 mHistory.getVodPic() 前面就会把真图挡住，所以占位图直接跳过。
+        if (mVod != null && !TextUtils.isEmpty(mVod.getPic()) && !History.isMissingArtwork(mVod.getPic())) {
+            return mVod.getPic();
+        }
         if (mHistory != null && !TextUtils.isEmpty(mHistory.getVodPic())) return mHistory.getVodPic();
         return getPic();
     }
 
     private String lockContextWall(String url) {
         String wall = Objects.toString(url, "");
-        if (mContextWallLockedUrl == null && !TextUtils.isEmpty(wall)) mContextWallLockedUrl = wall;
-        return mContextWallLockedUrl == null ? wall : mContextWallLockedUrl;
+        // 占位图（纸飞机）不算「已锁定」：它进页时先到，会把后面拿到的真图永远挡住。
+        if (History.isMissingArtwork(mContextWallLockedUrl)) mContextWallLockedUrl = null;
+        if (History.isMissingArtwork(wall)) return mContextWallLockedUrl == null ? wall : mContextWallLockedUrl;
+        if (mContextWallLockedUrl == null) mContextWallLockedUrl = wall;
+        return mContextWallLockedUrl;
     }
 
     private void setContextWall(String url) {
@@ -6540,7 +6670,8 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
                 : isOriginSession() ? resumeHistory : resumeHistory.forPlaybackKey(getHistoryKey(), VodConfig.getCid());
         mHistory = mHistory == null ? createHistory(item) : mHistory;
         if (!TextUtils.isEmpty(getWallPic())) mHistory.setWallPic(getWallPic());
-        if (!TextUtils.isEmpty(getMark())) mHistory.setVodRemarks(getMark());
+        // 文件夹点选需保留旧集身份，交给显式选集链路判断是否重置进度。
+        if (!TextUtils.isEmpty(getMark()) && findFolderPlaybackEpisode(item) == null) mHistory.setVodRemarks(getMark());
         applyIntentPlaybackSelection(item);
         if (resumeHistory == null && Setting.isIncognito() && mHistory.getKey().equals(getHistoryKey())) mHistory.delete();
         setOpeningEndingText();
@@ -6737,7 +6868,12 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         String playName = getIntentPlaybackEpisodeName();
         String playUrl = getIntentPlaybackEpisodeUrl();
         if (TextUtils.isEmpty(playFlag) && TextUtils.isEmpty(playFlagKey)
-                && TextUtils.isEmpty(playName) && TextUtils.isEmpty(playUrl)) return;
+                && TextUtils.isEmpty(playName) && TextUtils.isEmpty(playUrl)) {
+            Episode folderEpisode = findFolderPlaybackEpisode(item);
+            if (folderEpisode == null) return;
+            playName = folderEpisode.getName();
+            playUrl = folderEpisode.getUrl();
+        }
         Flag flag = findIntentPlaybackFlag(item.getFlags(), playFlagKey, playFlag, playUrl);
         if (flag == null) return;
         Episode episode = findIntentPlaybackEpisode(flag, playName, playUrl);
@@ -6760,6 +6896,20 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         mHistory.setVodRemarks(getHistoryEpisodeName(historyEpisode));
         mHistory.setEpisodeUrl(episode.getUrl());
         if (historyEpisode.getTmdbEpisode() != null || !sameEpisode) mHistory.setTmdbEpisodePosition(historyEpisode);
+    }
+
+    private Episode findFolderPlaybackEpisode(Vod item) {
+        String mark = getMark();
+        if (isResumeFromHistory() || TextUtils.isEmpty(mark)) return null;
+        Episode matched = null;
+        for (Flag flag : item.getFlags()) {
+            for (Episode episode : flag.getEpisodes()) {
+                if (!mark.equalsIgnoreCase(episode.getName())) continue;
+                if (matched != null && !TextUtils.equals(matched.getUrl(), episode.getUrl())) return null;
+                matched = episode;
+            }
+        }
+        return matched;
     }
 
     private Flag findIntentPlaybackFlag(List<Flag> flags, String playFlagKey, String playFlag, String playUrl) {
@@ -6890,7 +7040,15 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         mBinding.control.fullscreen.setImageResource(isFullscreen() ? R.drawable.ic_control_fullscreen_exit : R.drawable.ic_control_fullscreen);
     }
 
+    /**
+     * 就绪 = 详情已给出历史，且站点仍可解析（接口刷新后站点可能消失，getSite() 会返回 null）。
+     */
+    private boolean isKeepReady() {
+        return mHistory != null && getSite() != null;
+    }
+
     private void createKeep() {
+        if (!isKeepReady()) return;
         Keep keep = new Keep();
         keep.setKey(getHistoryKey());
         keep.setCid(VodConfig.getCid());
@@ -7126,9 +7284,9 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         boolean showViewMode = size > 1;
         if (showViewMode) mEpisodeGridMode = Setting.getTmdbEpisodeGridMode();
         if (!showViewMode) mEpisodeGridMode = true;
-        mBinding.control.action.episodes.setVisibility(size < 2 ? View.GONE : View.VISIBLE);
-        mBinding.control.action.next.setVisibility(size < 2 ? View.GONE : View.VISIBLE);
-        mBinding.control.action.prev.setVisibility(size < 2 ? View.GONE : View.VISIBLE);
+        PlayerButtonSetting.apply(mBinding.control.action.episodes, PlayerButtonSetting.EPISODES, size >= 2);
+        PlayerButtonSetting.apply(mBinding.control.action.next, PlayerButtonSetting.NEXT, size >= 2);
+        PlayerButtonSetting.apply(mBinding.control.action.prev, PlayerButtonSetting.PREV, size >= 2);
         applyActionButtonVisibility();
         mBinding.control.next.setVisibility(size < 2 ? View.GONE : View.VISIBLE);
         mBinding.control.prev.setVisibility(size < 2 ? View.GONE : View.VISIBLE);
@@ -8568,6 +8726,8 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         if (state == Player.STATE_READY) renewAutoDanmaku();
         switch (state) {
             case Player.STATE_BUFFERING:
+                // 缓冲/卡顿时挂起后台抽帧，别和播放抢带宽
+                TrickplayStore.setPlayerBusy(true);
                 // 播放器缓冲时始终显示加载动画（转圈+流量），不管 TMDB 内容是否加载完成
                 showProgress();
                 break;
@@ -8577,13 +8737,15 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
                 // 亮起，这里不收它就仍在屏上，由最小可见计时器与网速 ticker 收尾。
                 if (canHideSeekProgress()) showPlaybackContent();
                 if (mPendingKaraokeResult == null) mKaraokeResultShown = false;
-                boolean pendingResumeSeekApplied = applyPendingResumeSeek();
+                // 起播不卡之后就在后台把缩略图抽出来（先抽片头应急段），不必等第一次快进
+                TrickplayStore.setPlayerBusy(false);
+                TrickplayStore.startBackground(this, player().getUrl(), player().getHeaders(), player().getDuration());
                 checkControl();
                 refreshLyrics();
                 player().reset();
                 applyShortDramaMode();
                 requestIntroSkipPlan();
-                if (!pendingResumeSeekApplied) applyAutoIntroSkip();
+                applyAutoIntroSkip();
                 setAdFeedbackVisible(); // 播放地址确定后按格式刷新"有广告"按钮
                 if (!mShortDramaQueueSessionActive) beginShortDramaQueue();
                 // 首帧回调可能早于历史就绪或 Surface 尚未可抓帧，READY 后再补一次；
@@ -8609,6 +8771,7 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
 
     @Override
     protected void onPlayingChanged(boolean isPlaying) {
+        if (isPlaying) warmTrickplayAspect();
         syncLyricsPlaybackState(isPlaying);
         syncKaraokePosition();
         boolean audioMode = syncPiPForPlaybackMode();
@@ -8690,6 +8853,10 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
     @Override
     protected void onSeekStarted() {
         App.removeCallbacks(mSeekProgressFallback);
+        // 用户自己拖/点了跳转，就取消启动时的「续播位置」：以前这条在 READY 后仍会再跳一次，
+        // 把刚跳好的位置拉回原处（屏显到了、画面却还在原位）。
+        tmdbHistoryResumePending = false;
+        previewCommitTarget = C.TIME_UNSET;
         // 窗口必须在 showProgress() 之前打开：它内部会立刻投递网速 ticker，
         // 那个 ticker 的兜底收口会读到尚未开始 seek 的 READY。
         mSeekProgressPending = true;
@@ -8900,28 +9067,38 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         finish();
     }
 
-    private boolean applyPendingResumeSeek() {
-        if (pendingResumeSeekMs == C.TIME_UNSET || controller() == null) return false;
-        long target = pendingResumeSeekMs;
-        pendingResumeSeekMs = C.TIME_UNSET;
-        tmdbHistoryResumePending = false;
-        if (Math.abs(player().getPosition() - target) < 1500) return false;
-        controller().seekTo(target);
-        return true;
+    /** 续播补跳的回读：1 秒后打印引擎实际位置，日志里能直接看出补跳有没有落地。 */
+    private void logResumeSeekVerify(long target) {
+        App.post(() -> {
+            if (controller() == null) return;
+            SpiderDebug.log("playback", "resume-seek verify target=%d actual=%d duration=%d", target, player().getPosition(), player().getDuration());
+        }, 1000L);
+    }
+
+    /** 点缩略图后 0.9 秒复核：引擎没真的到目标点就再补一次。 */
+    private void retryPreviewCommitIfNeeded(long target) {
+        if (controller() == null) return;
+        if (previewCommitTarget != target) return;
+        previewCommitTarget = C.TIME_UNSET;
+        long pos = player().getPosition();
+        SpiderDebug.log("playback", "preview-commit verify target=%d actual=%d", target, pos);
+        if (Math.abs(pos - target) > 3000) {
+            SpiderDebug.log("playback", "preview-commit retry target=%d actual=%d", target, pos);
+            pinSeekDisplay(target);
+            controller().seekTo(target);
+        }
+    }
+
+    /** 历史进度在播放后才就绪（TMDB 匹配回来得晚）：此刻显式跳一次，位置取自历史，不读引擎回填值。 */
+    private void seekToResumePosition(long positionMs) {
+        if (controller() == null) return;
+        pinSeekDisplay(positionMs);
+        controller().seekTo(positionMs);
+        SpiderDebug.log("playback", "resume-seek explicit target=%d", positionMs);
     }
 
     private void setPosition() {
-        pendingResumeSeekMs = C.TIME_UNSET;
-        if (mHistory == null) {
-            tmdbHistoryResumePending = false;
-            mInitialPlaybackPosition = C.TIME_UNSET;
-            return;
-        }
-        if (hasDiscMenu()) {
-            tmdbHistoryResumePending = false;
-            mInitialPlaybackPosition = C.TIME_UNSET;
-            return;
-        }
+        if (mHistory == null || hasDiscMenu()) return;
         long position = resolveInitialPlaybackPosition();
         if (position == C.TIME_UNSET || position <= 0) {
             tmdbHistoryResumePending = false;
@@ -8935,12 +9112,11 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
             tmdbHistoryResumePending = false;
             return;
         }
-        mInitialPlaybackPosition = C.TIME_UNSET;
-        if (player().isIjk()) pendingResumeSeekMs = position;
-        else {
-            player().seekTo(position);
-            tmdbHistoryResumePending = false;
-        }
+        // 起播位置只有这一份：直接作为播放器的起播位置交下去，exo 与 ijk 都在 prepare 之前生效。
+        // 起播之后不补跳、不复核——引擎若真没落到这个位置，那要看 open start-at 日志查引擎原因，
+        // 不在这里用 seekTo 掩盖。
+        mInitialPlaybackPosition = position;
+        pinSeekDisplay(position);
     }
 
     private void setSpeed() {
@@ -9003,15 +9179,41 @@ private void checkOrientation() {
     }
 
     private void checkEnded(boolean notify) {
+        // 先把已播完的本集进度归零再切集：顺序不能反，切完 mHistory 已经是下一集了。
+        resetFinishedEpisodeProgress();
         checkNext(notify);
+    }
+
+    /**
+     * 本集播完（自然结束或快进越过片尾）时清掉这一集的进度。
+     *
+     * <p>不清的话，位置缓存里留着「已越过片尾」的位置，切回上一集时一开播就又满足片尾判据、
+     * 立刻被自动推进下一集，用户除非删掉历史否则再也进不去这一集。
+     * 只有存在上一集/下一集可切（多集）时才动，单集/电影不适用（没有「再切回来」这回事）。
+     */
+    private void resetFinishedEpisodeProgress() {
+        if (mHistory == null) return;
+        Flag flag = getFlag();
+        if (flag == null || flag.getEpisodes().size() < 2) return;
+        String cacheName = getCurrentHistoryEpisodeCacheName();
+        if (!TextUtils.isEmpty(cacheName) && !skipEpisodePositionCache()) {
+            // 位置写 0 而不是删记录：删了会被「保存进度」用旧的播放器位置再写回来。
+            EpisodePositionCache.get().put(getKey(), getId(), flag.getFlag(), cacheName, 0, mHistory.getDuration());
+            Task.execute(() -> EpisodePositionCache.get().save());
+        }
+        mHistory.setPosition(0);
+        syncHistory();
+        if (SpiderDebug.isEnabled()) {
+            SpiderDebug.log("playback-ending", "action=reset-progress episode=%s key=%s", cacheName, getKey());
+        }
     }
 
     private void setTrackVisible() {
         mBinding.control.action.discMenu.setVisibility(hasDiscMenu() ? View.VISIBLE : View.GONE);
         updateDiscMenuTools();
-        mBinding.control.action.text.setVisibility(player().haveTrack(C.TRACK_TYPE_TEXT) || player().isVod() ? View.VISIBLE : View.GONE);
-        mBinding.control.action.audio.setVisibility(player().haveTrack(C.TRACK_TYPE_AUDIO) ? View.VISIBLE : View.GONE);
-        mBinding.control.action.video.setVisibility(player().haveTrack(C.TRACK_TYPE_VIDEO) ? View.VISIBLE : View.GONE);
+        PlayerButtonSetting.apply(mBinding.control.action.text, PlayerButtonSetting.TEXT, player().haveTrack(C.TRACK_TYPE_TEXT) || player().isVod());
+        PlayerButtonSetting.apply(mBinding.control.action.audio, PlayerButtonSetting.AUDIO, player().haveTrack(C.TRACK_TYPE_AUDIO));
+        PlayerButtonSetting.apply(mBinding.control.action.video, PlayerButtonSetting.VIDEO, player().haveTrack(C.TRACK_TYPE_VIDEO));
         applyActionButtonVisibility();
     }
 
@@ -9034,7 +9236,7 @@ private void checkOrientation() {
     }
 
     private void setTitleVisible() {
-        mBinding.control.action.title.setVisibility(player().haveTitle() ? View.VISIBLE : View.GONE);
+        PlayerButtonSetting.apply(mBinding.control.action.title, PlayerButtonSetting.TITLE, player().haveTitle());
         applyActionButtonVisibility();
     }
 
@@ -10255,6 +10457,13 @@ private void checkOrientation() {
 
     private void applyShortDramaMode() {
         if (!isShortDramaSession()) return;
+        // 详情页里不替用户决定全屏：预览/详情拿到 READY 也不能自动跳到全屏，否则返回会直接退页。
+        if (!isFullscreen()) return;
+        // 旋转/铺满看画面比例，不看是不是短剧：横屏素材保持普通全屏形态。
+        if (!isPortraitVideo()) {
+            resetShortDramaLayout();
+            return;
+        }
         enterShortDramaFullscreen();
         setShortDramaScale();
         mBinding.exo.postDelayed(this::setShortDramaScale, 250);
@@ -10265,7 +10474,7 @@ private void checkOrientation() {
         if (!isFullscreen()) {
             setFullscreen(true);
             mBinding.video.setLayoutParams(new RelativeLayout.LayoutParams(RelativeLayout.LayoutParams.MATCH_PARENT, RelativeLayout.LayoutParams.MATCH_PARENT));
-            setRequestedOrientation(isPort() ? ActivityInfo.SCREEN_ORIENTATION_USER_PORTRAIT : ActivityInfo.SCREEN_ORIENTATION_FULL_USER);
+            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_USER_PORTRAIT);
             mKeyDown.resetScale();
         }
         syncShortDramaGesture();
@@ -10282,7 +10491,19 @@ private void checkOrientation() {
      * 竖滑就会误切集。同理换到另一部短剧时形态保持不变，标记也不该被清掉。
      */
     private void syncShortDramaGesture() {
-        if (mKeyDown != null) mKeyDown.setShortDrama(isFullscreen() && isShortDramaSession());
+        if (mKeyDown != null) mKeyDown.setShortDrama(isFullscreen() && isShortDramaSession() && isPortraitVideo());
+    }
+
+    private boolean isPortraitVideo() {
+        return service() != null && player() != null && !player().isEmpty()
+                && player().getVideoWidth() > 0 && player().getVideoHeight() > 0 && player().isPortrait();
+    }
+
+    /** 横屏短剧回普通全屏形态：还原画面布局比例，避免继续沿用竖屏铺满的裁切。 */
+    private void resetShortDramaLayout() {
+        mBinding.video.setLayoutParams(new RelativeLayout.LayoutParams(RelativeLayout.LayoutParams.MATCH_PARENT, RelativeLayout.LayoutParams.MATCH_PARENT));
+        if (mKeyDown != null) mKeyDown.resetScale();
+        setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_FULL_USER);
     }
 
     private void setShortDramaScale() {
@@ -10296,105 +10517,6 @@ private void checkOrientation() {
         markPlaybackExiting();
         saveHistory(true);
         finishPlayback();
-    }
-
-    private void syncShortDramaControlLayout(boolean shortDrama) {
-        if (!shortDrama) {
-            restoreShortDramaControls();
-            return;
-        }
-        dockShortDramaControls();
-        mBinding.control.action.getRoot().setVisibility(View.GONE);
-        mBinding.control.info.setVisibility(View.GONE);
-        mBinding.control.shortDramaChangeSource.setVisibility(View.VISIBLE);
-        mBinding.control.shortDramaEpisodes.setVisibility(View.VISIBLE);
-        // 画质仍受站点是否返回多地址约束（避免弹出只有一个选项的面板）。这里直接复用
-        // setQualityVisible 记下的结果，不再自行推导 Result：那些以 false 显式收起画质的
-        // 调用点（如未选中集数、切线路重置）与 Result.isMulti() 结论并不一致，
-        // 两个真值来源会让 dock 图标与 action 栏按钮状态相反。
-        mBinding.control.shortDramaQuality.setVisibility(mQualityVisible ? View.VISIBLE : View.GONE);
-        if (mShortDramaControlDock != null) mShortDramaControlDock.setVisibility(isLock() ? View.GONE : View.VISIBLE);
-    }
-
-    private void dockShortDramaControls() {
-        ViewGroup dock = getShortDramaControlDock();
-        if (shortDramaControlsDocked) return;
-        for (ShortDramaControlItem item : getShortDramaControlItems()) {
-            ViewGroup parent = (ViewGroup) item.view.getParent();
-            if (parent != null) parent.removeView(item.view);
-            dock.addView(item.view, item.layoutParams);
-        }
-        shortDramaControlsDocked = true;
-    }
-
-    private void restoreShortDramaControls() {
-        if (!shortDramaControlsDocked) return;
-        // 三个图标入口只服务短剧竖屏 dock，还原回顶部栏后必须重新隐藏
-        mBinding.control.shortDramaChangeSource.setVisibility(View.GONE);
-        mBinding.control.shortDramaQuality.setVisibility(View.GONE);
-        mBinding.control.shortDramaEpisodes.setVisibility(View.GONE);
-        // 先全部摘下再按记录索引升序插回：同一容器有多个搬迁项时（cast/keep/换源/画质/选集/设置同属顶部栏），
-        // 按声明顺序逐个插入会让后来者挤掉前者的位置，且 PlayerButtonSetting.applyOrder 可能已重排过容器，
-        // 声明顺序不保证等于索引升序。升序插入与「摘下前的原始索引」语义一致。
-        List<ShortDramaControlItem> items = new ArrayList<>(getShortDramaControlItems());
-        for (ShortDramaControlItem item : items) {
-            ViewGroup parent = (ViewGroup) item.view.getParent();
-            if (parent != null) parent.removeView(item.view);
-        }
-        items.sort(Comparator.comparingInt(item -> item.index));
-        for (ShortDramaControlItem item : items) {
-            item.parent.addView(item.view, Math.min(item.index, item.parent.getChildCount()), item.layoutParams);
-        }
-        if (mShortDramaControlDock != null && mShortDramaControlDock.getParent() instanceof ViewGroup) {
-            ((ViewGroup) mShortDramaControlDock.getParent()).removeView(mShortDramaControlDock);
-        }
-        shortDramaControlsDocked = false;
-    }
-
-    private ViewGroup getShortDramaControlDock() {
-        ViewGroup right = mBinding.control.right.getRoot();
-        if (mShortDramaControlDock == null) {
-            LinearLayoutCompat dock = new LinearLayoutCompat(this);
-            dock.setGravity(android.view.Gravity.CENTER);
-            dock.setOrientation(LinearLayoutCompat.VERTICAL);
-            mShortDramaControlDock = dock;
-        }
-        if (mShortDramaControlDock.getParent() != right) {
-            int index = Math.min(right.indexOfChild(mBinding.control.right.lock) + 1, right.getChildCount());
-            right.addView(mShortDramaControlDock, index, new LinearLayoutCompat.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        }
-        return mShortDramaControlDock;
-    }
-
-    private List<ShortDramaControlItem> getShortDramaControlItems() {
-        if (mShortDramaControlItems.isEmpty()) {
-            for (View view : getShortDramaControlViews()) {
-                if (view.getParent() instanceof ViewGroup) mShortDramaControlItems.add(new ShortDramaControlItem(view));
-            }
-        }
-        return mShortDramaControlItems;
-    }
-
-    /**
-     * 短剧模式下搬到右侧竖排 dock 的控件。
-     * <p>
-     * action 栏整条被隐藏（见 syncShortDramaControlLayout），只有搬进 dock 的控件才可达，
-     * 所以换源/画质/选集必须列在这里，否则短剧只能换线路、不能换站点和画质。
-     * <p>
-     * 这里用的是 shortDramaChangeSource/shortDramaQuality/shortDramaEpisodes 三个专用 48dp 图标，
-     * 而不是 action 栏里的 MaterialTextView（change2/actionQuality/episodes）——dock 全是图标，
-     * 混入文字按钮会很突兀。id 带 shortDrama 前缀是为了避开同一视图树里的 quality/episodes 重名。
-     * 本列表顺序不必等于容器顺序，restoreShortDramaControls 按记录的原始索引升序插回。
-     */
-    private View[] getShortDramaControlViews() {
-        return new View[]{
-                mBinding.control.cast,
-                mBinding.control.keep,
-                mBinding.control.shortDramaChangeSource,
-                mBinding.control.shortDramaQuality,
-                mBinding.control.shortDramaEpisodes,
-                mBinding.control.setting,
-        };
     }
 
     private boolean isInitAuto() {
@@ -10541,15 +10663,25 @@ private void checkOrientation() {
 
     @Override
     public void onSeeking(long time) {
+        driveSeekPreview(time);
         mBinding.widget.action.setImageResource(time > 0 ? R.drawable.ic_widget_forward : R.drawable.ic_widget_rewind);
-        mBinding.widget.time.setText(player().getPositionTime(time));
+        // 快进/快退期间引擎可能还报 0（尤其是刚起播或 SMB 正在定位），
+        // 屏显一律用「游标起点 + 本次偏移」，绝不留成 00:00。
+        long shownAt = Math.max(0, player().getPosition()) + time;
+        if (shownAt <= 0 && mSeekPreviewBase > 0) shownAt = mSeekPreviewBase + time;
+        mBinding.widget.time.setText(com.fongmi.android.tv.utils.Util.timeMs(Math.max(0, shownAt)));
         mBinding.widget.seek.setVisibility(View.VISIBLE);
         hideProgress();
     }
 
     @Override
     public void onSeekEnd(long time) {
+        // 松手这一刻要真跳转：先停掉在跑的补帧，别让它和这次 seek 抢同一条连接（电视上最明显）。
+        com.fongmi.android.tv.player.TrickplayStore.cancelAll();
         seekTo(time);
+        mSeekPreviewSessionStarted = false;
+        cancelPendingSeekPreview();
+        if (mSeekPreview != null && mSeekPreview.isActive()) mSeekPreview.hold();
     }
 
     @Override
@@ -10756,6 +10888,13 @@ private void checkOrientation() {
 
     @Override
     protected void onBackInvoked() {
+        // 手势返回第一下先收预览条，不要直接退出全屏/结束播放。
+        if (mSeekPreview != null && mSeekPreview.isActive()) {
+            cancelPendingSeekPreview();
+            mSeekPreviewSessionStarted = false;
+            mSeekPreview.dismiss();
+            return;
+        }
         if (hasLutQuick() && mBinding.lutQuick.hideIfVisible()) {
             return;
         } else if (isVisible(mBinding.control.getRoot())) {
@@ -10793,6 +10932,10 @@ private void checkOrientation() {
 
     @Override
     protected void onDestroy() {
+        TrickplayStore.stopBackground();
+        cancelPendingSeekPreview();
+        mSeekPreviewHandler.removeCallbacksAndMessages(null);
+        if (mSeekPreview != null) mSeekPreview.dismiss();
         mDanmakuRetired = true;
         invalidateAutoDanmaku();
         if (mCustomButtonPlayer != null) {
@@ -10975,20 +11118,6 @@ private void checkOrientation() {
             com.fongmi.android.tv.api.config.UserAdRuleStore.add(rule);
             Notify.show(R.string.ad_feedback_saved);
         });
-    }
-
-    private static class ShortDramaControlItem {
-        private final View view;
-        private final ViewGroup parent;
-        private final ViewGroup.LayoutParams layoutParams;
-        private final int index;
-
-        private ShortDramaControlItem(View view) {
-            this.view = view;
-            this.parent = (ViewGroup) view.getParent();
-            this.layoutParams = view.getLayoutParams();
-            this.index = parent.indexOfChild(view);
-        }
     }
 
     private static class TmdbMovedView {
